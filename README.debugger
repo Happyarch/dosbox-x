@@ -129,6 +129,22 @@ MEMS <operator> <value>                     Search a value within the find insta
 IV <seg> <off> <name>                       Insert variable
 SV <name>                                   Save variables to <name>
 LV <name>                                   Load variables from <name>
+SYMF <file> [selector]                      Load program symbol file. Lines are
+                                            "<hex-offset> <kind> <name>", kind one of
+                                            T/t/D/d/B/b as in nm(1), '#' comments.
+                                            Offsets are segment offsets, resolved
+                                            lazily: without [selector], code symbols
+                                            use the current CS and data symbols the
+                                            current DS at each use. Loaded names work
+                                            in any address expression (BP CS:MySym,
+                                            C CS:MySym, EV MySym+4); the code view
+                                            labels rows and call/jmp targets. A name
+                                            made only of hex digits is shadowed by
+                                            the hex-literal interpretation.
+SYMLIST [pattern]                           List loaded symbols (substring match)
+SYMNEAR <offset-expr>                       Nearest symbol at or below offset
+                                            (e.g. SYMNEAR EIP)
+SYMCLEAR                                    Drop the program symbol table
 SR <reg> <value>                            Set register <reg> value to <value>
 SM <seg> <off> [bytes in hex]               Set memory at <seg>:<off> to byte values given
 SMV <off> [bytes in hex]                    Set memory at linear/virtual <off> to byte values
