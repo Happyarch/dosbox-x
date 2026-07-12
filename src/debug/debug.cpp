@@ -2509,26 +2509,38 @@ bool ParseCommand(char* str) {
 
 	if (command == "SYMF") { // load program symbol file: SYMF <file> [selector]
 		/* the file path is case-sensitive: recover it from the original,
-		   un-uppercased input string */
+		   un-uppercased input string. A double-quoted path may contain
+		   spaces ("/path/with spaces/pkmn.sym"). */
 		const char* argraw = str + argOffsetInStr;
 		while (*argraw == ' ' || *argraw == '\t') argraw++;
 		char fname[256];
 		size_t fi = 0;
-		while (argraw[fi] && !isspace((unsigned char)argraw[fi]) && fi < sizeof(fname)-1) {
-			fname[fi] = argraw[fi];
-			fi++;
+		const char* argend; /* first char after the path token in str */
+		if (*argraw == '"') {
+			const char* p = argraw + 1;
+			while (*p && *p != '"' && fi < sizeof(fname)-1) fname[fi++] = *p++;
+			if (*p == '"') p++;
+			argend = p;
+		} else {
+			const char* p = argraw;
+			while (*p && !isspace((unsigned char)*p) && fi < sizeof(fname)-1) fname[fi++] = *p++;
+			argend = p;
 		}
 		fname[fi] = 0;
 		if (!fname[0]) {
 			DEBUG_ShowMsg("DEBUG: usage: SYMF <file> [selector]\n");
 			return false;
 		}
-		/* optional selector: parse from the uppercased remainder */
+		/* optional selector: parse the remainder past the (possibly quoted)
+		   path. 'found' cannot be used -- its uppercased copy of a quoted path
+		   tokenizes differently -- so re-anchor into the uppercased copy at
+		   the same offset so GetHexValue sees its usual uppercased input. */
 		uint16_t sel = 0;
-		char* p = found;
-		while (*p && !isspace((unsigned char)*p)) p++;
-		while (*p == ' ') p++;
-		if (*p) sel = (uint16_t)GetHexValue(p,p);
+		{
+			char* p = &copy_str[0] + (size_t)(argend - str);
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p) sel = (uint16_t)GetHexValue(p,p);
+		}
 		unsigned long hexShadowed = 0;
 		long count = DEBUG_SymLoadFile(fname, sel, &hexShadowed);
 		if (count < 0) {
