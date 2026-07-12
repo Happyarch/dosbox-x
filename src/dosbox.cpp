@@ -429,9 +429,22 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
+/* MCP: soft-break flag set by socket thread; checked between CPU cycles */
+extern volatile bool mcp_break_pending;
+extern Bitu DEBUG_EnableDebugger(void);
+
 static Bitu Normal_Loop(void) {
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
+
+    /* MCP: if socket client requested a break, drop into the headless debugger.
+     * Return 0 so DOSBOX_RunMachine continues looping with the new loop handler
+     * (mcp_headless_loop) that DEBUG_Enable_Handler installs. */
+    if (GCC_UNLIKELY(mcp_break_pending)) {
+        mcp_break_pending = false;
+        DEBUG_EnableDebugger();
+        return 0;
+    }
 
     if (!menu.hidecycles || menu.showrt) { /* sdlmain.cpp/render.cpp doesn't even maintain the frames count when hiding cycles! */
         uint32_t ticksNew = GetTicks();

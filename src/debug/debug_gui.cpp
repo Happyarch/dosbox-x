@@ -46,6 +46,10 @@ bool log_int21 = false;
 bool log_fileio = false;
 extern bool logging_con;
 
+/* MCP capture hook (defined in debug.cpp) */
+extern bool        mcp_capture_active;
+extern std::string mcp_capture_buf;
+
 static bool has_LOG_Init = false;
 static bool has_LOG_EarlyInit = false;
 static bool do_LOG_stderr = false;
@@ -831,6 +835,11 @@ void DEBUG_ShowMsg(char const* format,...) {
     }
 #endif
 
+    if (mcp_capture_active) {
+        mcp_capture_buf += buf;
+        mcp_capture_buf += '\n';
+    }
+
     in_debug_showmsg = false;
 }
 
@@ -1055,4 +1064,7 @@ void LOG::SetupConfigSection(void) {
 	Pstring->Set_help("The run mode when the DOSBox-X Debugger starts.");
 	Pstring->Set_values(debuggerrunopt);
 	Pstring->SetBasic(true);
+
+	Pstring = sect->Add_string("mcp_socket",Property::Changeable::OnlyAtStart,"");
+	Pstring->Set_help("Unix socket path for MCP debugger control (empty = disabled). E.g. /tmp/dosbox-mcp.sock");
 }
