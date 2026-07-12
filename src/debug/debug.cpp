@@ -583,11 +583,13 @@ std::vector<CDebugVar*> CDebugVar::varList;
  * the moment of use.
  *
  * The expression parser (GetHexValue) consults this table for identifier
- * tokens that are not registers/flags and not pure hex digits, so symbol
- * names work anywhere an address expression does: BP CS:OverworldLoop,
- * C CS:MySym, EV MySym+4, ... A name made ONLY of hex digits (e.g. "fade")
- * is shadowed by the hex-literal interpretation; SYMF warns when it loads
- * such names (use SYMLIST/SYMNEAR to work with them).
+ * tokens, so symbol names work anywhere an address expression does:
+ * BP CS:OverworldLoop, C CS:MySym, EV MySym+4, ... Precedence is
+ * register/flag -> symbol -> hex literal; digit-leading tokens are always
+ * hex (a symbol name cannot start with a digit), and double-quoting forces
+ * hex ("ADDBCD"), the same escape that already disambiguates flag-colliding
+ * values like "AF". Only names that collide with a register/flag/pseudo
+ * token stay unreachable by name; SYMF warns when it loads such names.
  * -------------------------------------------------------------------------- */
 
 struct DebugSymbol {
@@ -644,14 +646,31 @@ const DebugSymbol* DEBUG_SymNearest(uint32_t ofs, bool codeOnly, uint32_t* delta
     return NULL;
 }
 
+/* names GetHexValue resolves before the symbol table -- symbols so named are
+ * unreachable by name in expressions (quote-as-hex does not help either) */
+static bool DebugSymIsReservedName(const std::string& upperName) {
+    static const char* const reserved[] = {
+        "EFLAGS","FLAGS","IOPL","CR0","CR2","CR3","CR4","SYSENTER",
+        "EAX","EBX","ECX","EDX","ESI","EDI","EBP","ESP","EIP",
+        "AX","BX","CX","DX","SI","DI","BP","SP","IP",
+        "AL","BL","CL","DL","AH","BH","CH","DH",
+        "CS","DS","ES","FS","GS","SS",
+        "AC","AF","CF","DF","ID","IF","NT","OF","PF","SF","TF","VM","ZF",
+        "DTASEG","DTAOFF","PSPSEG", NULL
+    };
+    for (size_t i = 0; reserved[i]; i++)
+        if (upperName == reserved[i]) return true;
+    return false;
+}
+
 /* returns number of symbols loaded, or -1 on open failure.
- * hexShadowed (optional out): how many names are pure hex digits and thus
- * shadowed by hex literals in expressions. */
-long DEBUG_SymLoadFile(const char* path, uint16_t forcedSel, unsigned long* hexShadowed) {
+ * shadowed (optional out): how many names collide with a register/flag/
+ * pseudo token and are therefore unreachable by name in expressions. */
+long DEBUG_SymLoadFile(const char* path, uint16_t forcedSel, unsigned long* shadowed) {
     FILE* f = fopen(path, "r");
     if (!f) return -1;
     DEBUG_SymClear();
-    if (hexShadowed) *hexShadowed = 0;
+    if (shadowed) *shadowed = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         char* p = line;
@@ -684,11 +703,7 @@ long DEBUG_SymLoadFile(const char* path, uint16_t forcedSel, unsigned long* hexS
     for (size_t i = 0; i < dbgSyms.size(); i++) {
         const std::string key = DebugSymUpcase(dbgSyms[i].name);
         dbgSymsByName.emplace(key, i);   /* first definition wins */
-        if (hexShadowed) {
-            bool allhex = true;
-            for (const char c : key) { if (!isxdigit((unsigned char)c)) { allhex = false; break; } }
-            if (allhex) (*hexShadowed)++;
-        }
+        if (shadowed && DebugSymIsReservedName(key)) (*shadowed)++;
     }
     return (long)dbgSyms.size();
 }
@@ -1809,8 +1824,17 @@ uint32_t GetHexValue(char* const str, char* &hex,bool *parsed,int exprge)
             else if (something == "DTASEG") { regval = (!dos_kernel_disabled) ? (dos.dta() >> 16u)    : 0; }
             else if (something == "DTAOFF") { regval = (!dos_kernel_disabled) ? (dos.dta() & 0xFFFFu) : 0; }
             else if (something == "PSPSEG") { regval = (!dos_kernel_disabled) ?  dos.psp()            : 0; }
+            /* Program symbols (SYMF) resolve BEFORE the hex-literal fallback,
+               so names made only of hex digits (AddBCD) work like any other
+               name. This cannot break machine-generated hex (disassembly
+               operands, "0001F2A0"): those start with a digit, and a symbol
+               name never can — digit-leading tokens skip the lookup. To force
+               a hex literal that collides with a symbol name, quote it
+               ("ADDBCD"), the same escape that already forces hex for
+               flag-colliding values like "AF". */
+            else if (!isdigit((unsigned char)something[0]) &&
+                     DEBUG_SymTokenValue(something,&regval)) { /* symbol -> segment offset */ }
             else if (hexnumber) { regval = (uint32_t)strtoul(something.c_str(),NULL,16/*hexadecimal*/); }
-            else if (DEBUG_SymTokenValue(something,&regval)) { /* program symbol (SYMF) -> segment offset */ }
             else { if (parsed) *parsed = 0; return 0; }
         }
         /* quoted */
@@ -2541,17 +2565,17 @@ bool ParseCommand(char* str) {
 			while (*p == ' ' || *p == '\t') p++;
 			if (*p) sel = (uint16_t)GetHexValue(p,p);
 		}
-		unsigned long hexShadowed = 0;
-		long count = DEBUG_SymLoadFile(fname, sel, &hexShadowed);
+		unsigned long shadowed = 0;
+		long count = DEBUG_SymLoadFile(fname, sel, &shadowed);
 		if (count < 0) {
 			DEBUG_ShowMsg("DEBUG: SYMF: cannot open %s\n", fname);
 			return false;
 		}
 		DEBUG_ShowMsg("DEBUG: SYMF: loaded %ld symbols from %s%s\n",
 		              count, fname, sel ? " (forced selector)" : " (dynamic CS/DS)");
-		if (hexShadowed)
-			DEBUG_ShowMsg("DEBUG: SYMF: %lu names are pure hex digits; hex literals shadow them in expressions\n",
-			              hexShadowed);
+		if (shadowed)
+			DEBUG_ShowMsg("DEBUG: SYMF: %lu names collide with register/flag tokens and are unreachable by name\n",
+			              shadowed);
 		return true;
 	}
 

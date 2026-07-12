@@ -138,9 +138,15 @@ SYMF <file> [selector]                      Load program symbol file. Lines are
                                             current DS at each use. Loaded names work
                                             in any address expression (BP CS:MySym,
                                             C CS:MySym, EV MySym+4); the code view
-                                            labels rows and call/jmp targets. A name
-                                            made only of hex digits is shadowed by
-                                            the hex-literal interpretation.
+                                            labels rows and call/jmp targets.
+                                            Precedence: register/flag, then symbol,
+                                            then hex literal. Digit-leading tokens
+                                            are always hex (symbol names cannot
+                                            start with a digit); double-quote a
+                                            value ("ADDBCD") to force hex when it
+                                            collides with a symbol name. Names that
+                                            collide with register/flag tokens stay
+                                            unreachable by name (SYMF warns).
 SYMLIST [pattern]                           List loaded symbols (substring match)
 SYMNEAR <offset-expr>                       Nearest symbol at or below offset
                                             (e.g. SYMNEAR EIP)
