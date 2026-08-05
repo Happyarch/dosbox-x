@@ -472,6 +472,54 @@ void AspectRatio_mapper_shortcut(bool pressed) {
 
 void VGA_DebugOverlay();
 
+/* MCP: capture the current frame to an image file RIGHT NOW.
+ *
+ * The normal screenshot path only arms CaptureState and waits for the next
+ * RENDER_EndUpdate to hand the frame to CAPTURE_AddImage.  That is useless to
+ * the MCP debug bridge: its commands only run while the emulation thread sits
+ * in the debugger loop, where no further frame is rendered — so an armed
+ * capture would never fire, and the bridge would have to either hang or lie
+ * about a file that does not exist.
+ *
+ * scalerSourceCacheBuffer holds the complete most-recently-rendered SOURCE
+ * frame (the scaler writes every line into it for change detection), and it
+ * is the very buffer RENDER_EndUpdate hands to CAPTURE_AddImage.  Feeding it
+ * directly makes the capture synchronous and independent of the emulator's
+ * run state: the PNG exists by the time this returns.
+ *
+ * Returns false when there is nothing to capture (renderer never started, or
+ * a zero-sized/undescribed source) so the caller can report an honest error
+ * rather than a phantom path.  CAPTURE_AddImage clears CAPTURE_IMAGE itself. */
+bool RENDER_CaptureImageNow(unsigned int *w,unsigned int *h,unsigned int *bpp) {
+#if (C_SSHOT)
+    if (w) *w = (unsigned int)render.src.width;
+    if (h) *h = (unsigned int)render.src.height;
+    if (bpp) *bpp = (unsigned int)render.src.bpp;
+
+    if (scalerSourceCacheBuffer == NULL) return false;
+    if (render.src.width == 0 || render.src.height == 0 || render.src.bpp == 0)
+        return false;
+    if (render.scale.cachePitch == 0) return false;
+
+    Bitu flags = 0;
+    if (render.src.dblw != render.src.dblh) {
+        if (render.src.dblw) flags |= CAPTURE_FLAG_DBLW;
+        if (render.src.dblh) flags |= CAPTURE_FLAG_DBLH;
+    }
+    float fps = render.src.fps;
+    if (render.frameskip.max)
+        fps /= 1+render.frameskip.max;
+
+    CAPTURE_AddImage(render.src.width, render.src.height, render.src.bpp,
+                     render.scale.cachePitch, flags, fps,
+                     (uint8_t*)scalerSourceCacheBuffer, (uint8_t*)&render.pal.rgb);
+    return true;
+#else
+    (void)w; (void)h; (void)bpp;
+    return false;
+#endif
+}
+
 void RENDER_EndUpdate( bool abort ) {
     //LOG_MSG("RENDER_EndUpdate called abort=%d", abort ? 1 : 0);
     if (GCC_UNLIKELY(!render.updating))

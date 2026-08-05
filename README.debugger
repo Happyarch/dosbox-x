@@ -151,6 +151,36 @@ SYMLIST [pattern]                           List loaded symbols (substring match
 SYMNEAR <offset-expr>                       Nearest symbol at or below offset
                                             (e.g. SYMNEAR EIP)
 SYMCLEAR                                    Drop the program symbol table
+REGJSON                                     Emit all x86 registers as one JSON
+                                            object (machine-readable; MCP use)
+SCREENSHOT                                  Capture the video output to a PNG and
+                                            print its absolute path, SYNCHRONOUSLY
+                                            - the file exists before the command
+                                            replies. Works while emulation is
+                                            stopped, and depends on nothing about
+                                            the guest program, so it captures DOS
+                                            console text, a DPMI page-fault dump,
+                                            or a crashed program's leftover screen.
+                                            This is the "Save screenshot" kind
+                                            (CAPTURE_IMAGE, the render source).
+                                            Replies:
+                                              SCREENSHOT SRC <w>x<h> bpp=<n>
+                                              SCREENSHOT <absolute path>
+                                              SCREENSHOT ERROR <reason>
+SCREENSHOT ARM                              Arm the standard frame-driven capture
+                                            instead; it fires on the next rendered
+                                            frame, i.e. after RUN. Replies ARMED,
+                                            never a path.
+SCREENSHOT PATH                             Report the file an ARMed capture wrote,
+                                            once it has fired.
+SCREENSHOT RAW                              Refused, with the reason: "Save raw
+                                            screenshot" (CAPTURE_RAWIMAGE) is
+                                            accumulated across a frame by the
+                                            scanline handlers and finished on a
+                                            later vertical retrace, neither of
+                                            which happens while emulation is
+                                            stopped. Use the mapper hotkey with the
+                                            emulator running.
 SR <reg> <value>                            Set register <reg> value to <value>
 SM <seg> <off> [bytes in hex]               Set memory at <seg>:<off> to byte values given
 SMV <off> [bytes in hex]                    Set memory at linear/virtual <off> to byte values

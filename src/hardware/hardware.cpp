@@ -74,6 +74,15 @@ bool skip_encoding_unchanged_frames = false, show_recorded_filename = true;
 std::string pathvid = "", pathwav = "", pathmtw = "", pathmid = "", pathopl = "", pathscr = "", pathprt = "", pathpcap = "";
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
 
+/* MCP: set by the debugger's SCREENSHOT command around its synchronous
+ * capture (see RENDER_CaptureImageNow).  CAPTURE_AddImage clears pathscr as
+ * soon as it is done, so the bridge cannot read the filename afterwards —
+ * it is copied here instead.  The flag also suppresses the modal
+ * "Recording completed" box, which would block the emulation thread forever
+ * in an unattended agent session. */
+bool        mcp_screenshot_request = false;
+std::string mcp_screenshot_path    = "";
+
 FILE* pcap_fp = NULL;
 
 void pcap_writer_close(void) {
@@ -984,7 +993,11 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 		png_destroy_write_struct(&png_ptr, &info_ptr);
 		/*close file*/
 		fclose(fp);
-		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
+		/* MCP screenshot: hand the filename to the bridge and stay silent —
+		 * no modal box on an unattended emulation thread. */
+		if (mcp_screenshot_request)
+			mcp_screenshot_path = pathscr;
+		else if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
 
 	}
 	pathscr = "";

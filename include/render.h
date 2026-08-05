@@ -192,6 +192,10 @@ void RENDER_EndUpdate(bool abort);
 void RENDER_SetPal(uint8_t entry,uint8_t red,uint8_t green,uint8_t blue);
 bool RENDER_GetForceUpdate(void);
 void RENDER_SetForceUpdate(bool);
+/* MCP: write the most recently rendered source frame out through
+ * CAPTURE_AddImage immediately, instead of waiting for the next
+ * RENDER_EndUpdate.  Caller sets CaptureState |= CAPTURE_IMAGE first. */
+bool RENDER_CaptureImageNow(unsigned int *w,unsigned int *h,unsigned int *bpp);
 
 bool TempLineAlloc(unsigned int w);
 void TempLineFree(void);
