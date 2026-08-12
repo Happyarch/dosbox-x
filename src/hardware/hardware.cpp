@@ -1303,10 +1303,22 @@ skip_shot:
 			ffmpeg_aud_ctx->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
 			#endif
 
+			/* FFmpeg 7.1 (libavcodec 61.13.100) deprecated AVCodec::sample_fmts in
+			 * favour of avcodec_get_supported_config(), and FFmpeg 9 (libavcodec 63)
+			 * removed the field outright. Guarded so this still builds against older
+			 * libavcodec, matching the style of the ch_layout guard above. */
+			#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61,13,100)
 			if (ffmpeg_aud_codec->sample_fmts != NULL)
 				ffmpeg_aud_ctx->sample_fmt = (ffmpeg_aud_codec->sample_fmts)[0];
 			else
 				ffmpeg_aud_ctx->sample_fmt = AV_SAMPLE_FMT_FLT;
+			#else
+			{
+				const enum AVSampleFormat* ffmpeg_aud_sample_fmts = NULL;
+				avcodec_get_supported_config(NULL, ffmpeg_aud_codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, (const void**)&ffmpeg_aud_sample_fmts, NULL);
+				ffmpeg_aud_ctx->sample_fmt = (ffmpeg_aud_sample_fmts != NULL) ? ffmpeg_aud_sample_fmts[0] : AV_SAMPLE_FMT_FLT;
+			}
+			#endif
 
 			if (avcodec_open2(ffmpeg_aud_ctx,ffmpeg_aud_codec,NULL) < 0) {
 				LOG_MSG("Failed to open audio codec");
