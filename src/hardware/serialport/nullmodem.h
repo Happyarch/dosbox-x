@@ -90,6 +90,13 @@ private:
 	Bitu tx_gather;		// how long to gather tx data before
 						// sending all of them [milliseconds]
 
+	// NMDBG (mcp-debug): link-stall diagnosis counters, printed as a 1 Hz
+	// heartbeat from SERIAL_POLLING_EVENT.
+	Bitu nmdbg_hb = 0;              // polling events since last heartbeat
+	unsigned long nmdbg_rx = 0;     // bytes delivered by doReceive
+	unsigned long nmdbg_tx = 0;     // bytes handed to WriteChar
+	unsigned long nmdbg_fl = 0;     // bytes flushed out of the gather buffer
+
 	
 	bool dtrrespect;	// dtr behavior - only send data to the serial
 						// port when DTR is on

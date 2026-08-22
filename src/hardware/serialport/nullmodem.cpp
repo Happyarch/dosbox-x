@@ -24,6 +24,7 @@
 
 #include "control.h"
 #include "logging.h"
+#include "pic.h"
 #include "serialport.h"
 #include "nullmodem.h"
 
@@ -177,6 +178,7 @@ CNullModem::~CNullModem() {
 }
 
 void CNullModem::WriteChar(uint8_t data) {
+	nmdbg_tx++;
 	if (clientsocket)clientsocket->SendByteBuffered(data);
 	if (!tx_block) {
 		//LOG_MSG("setevreduct");
@@ -225,6 +227,7 @@ bool CNullModem::ClientConnect(NETClientSocket *newsocket) {
 	rx_state=N_RX_IDLE;
 	LOG_MSG("Serial%d: Connected to %s",(int)COMNUMBER,peernamebuf);
 	setEvent(SERIAL_POLLING_EVENT, 1);
+	LOG_MSG("NMDBG Serial%d: polling armed (client connect)",(int)COMNUMBER);
 	setCD(true);
 	return true;
 }
@@ -264,7 +267,8 @@ bool CNullModem::ServerConnect() {
 	clientsocket->SetSendBufferSize(256);
 	rx_state=N_RX_IDLE;
 	setEvent(SERIAL_POLLING_EVENT, 1);
-	
+	LOG_MSG("NMDBG Serial%d: polling armed (server accept)",(int)COMNUMBER);
+
 	// we don't accept further connections
 	delete serversocket;
 	serversocket = nullptr;
@@ -306,6 +310,24 @@ void CNullModem::handleUpperEvent(uint16_t type) {
 			setEvent(SERIAL_POLLING_EVENT, 1.0f);
 			// update Modem input line states
 			updateMSR();
+			{
+				// NMDBG: one-shot first-dispatch marker (only serial1 is a
+				// nullmodem in this project, so a function-local static is fine)
+				static bool nmdbg_first_poll = false;
+				if (!nmdbg_first_poll) {
+					nmdbg_first_poll = true;
+					LOG_MSG("NMDBG Serial%d: polling first fire t=%lu",
+						(int)COMNUMBER,(unsigned long)PIC_FullIndex());
+				}
+			}
+			if (++nmdbg_hb >= 1000) {
+				nmdbg_hb = 0;
+				LOG_MSG("NMDBG t=%lu st=%u retry=%u txblk=%u sbi=%u rx=%lu tx=%lu fl=%lu",
+					(unsigned long)PIC_FullIndex(), (unsigned)rx_state, (unsigned)rx_retry,
+					(unsigned)(tx_block?1:0),
+					(unsigned)(clientsocket?clientsocket->GetSendBufferIndex():0u),
+					nmdbg_rx, nmdbg_tx, nmdbg_fl);
+			}
 			switch(rx_state) {
 				case N_RX_IDLE:
 					if (CanReceiveByte()) {
@@ -432,9 +454,12 @@ void CNullModem::handleUpperEvent(uint16_t type) {
 		}
 		case SERIAL_TX_REDUCTION: {
 			// Flush the data in the transmitting buffer.
-			if (clientsocket) clientsocket->FlushBuffer();
+			if (clientsocket) {
+				nmdbg_fl += clientsocket->GetSendBufferIndex();
+				clientsocket->FlushBuffer();
+			}
 			tx_block=false;
-			break;						  
+			break;
 		}
 		case SERIAL_NULLMODEM_DTR_EVENT: {
 			if ((!DTR_delta) && getDTR()) {
@@ -465,6 +490,7 @@ bool CNullModem::doReceive () {
 		uint8_t val;
 		Bits rxchar = readChar(val);
 		if (rxchar>=0) {
+			nmdbg_rx++;
 			receiveByteEx((uint8_t)rxchar,0);
 			return true;
 		}

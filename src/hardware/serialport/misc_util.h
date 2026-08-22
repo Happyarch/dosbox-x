@@ -116,6 +116,7 @@ public:
 	void FlushBuffer();
 	void SetSendBufferSize(size_t n);
 	bool SendByteBuffered(uint8_t val);
+	size_t GetSendBufferIndex() const { return sendbufferindex; }
 
 	bool isopen = false;
 
