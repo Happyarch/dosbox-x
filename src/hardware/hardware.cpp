@@ -348,7 +348,6 @@ std::string capturedir;
 extern std::string savefilename;
 extern bool showdbcs, use_save_file, noremark_save_state, force_load_state;
 extern unsigned int hostkeyalt, sendkeymap;
-extern const char* RunningProgram;
 Bitu CaptureState = 0;
 
 void OPL_SaveRawEvent(bool pressed), SetGameState_Run(int value), ResolvePath(std::string& in);
@@ -558,7 +557,7 @@ std::string GetCaptureFilePath(const char * type,const char * ext) {
 			return {};
 		}
 	}
-	strcpy(file_start,RunningProgram);
+	strcpy(file_start,RunningProgram.c_str());
 	lowcase(file_start);
 	for (char *s=(char*)file_start;*s;s++) *s = filtercapname(*s);
 	strcat(file_start,"_");
@@ -604,7 +603,7 @@ FILE * OpenCaptureFile(const char * type,const char * ext) {
 			return nullptr;
 		}
 	}
-	strcpy(file_start,RunningProgram);
+	strcpy(file_start,RunningProgram.c_str());
 	lowcase(file_start);
 	for (char *s=(char*)file_start;*s;s++) *s = filtercapname(*s);
 	strcat(file_start,"_");
@@ -2362,4 +2361,3 @@ bool capture_fmt_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const 
 #endif
     return true;
 }
-
