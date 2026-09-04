@@ -40,9 +40,12 @@ using namespace std;
 
 /* MCP debug socket */
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <errno.h>
+#include <time.h>
 
 #include "debug.h"
 #include "agent/agent_bridge.h"
@@ -6663,6 +6666,78 @@ void DEBUG_ShutDown(Section * /*sec*/) {
 
 Bitu debugCallback;
 
+/* Design A ("force_break preemption"): blocking socket waits with a
+ * parked-BREAK preemption poll (2026-09).
+ *
+ * While a RUN is outstanding the socket thread sits in mcp_wait_for_response
+ * below instead of pthread_cond_wait.  Every ~75ms it peeks at the client
+ * socket without consuming anything: a complete "BREAK\n" line is consumed
+ * (exactly those bytes) and parked as mcp_break_pending, which Normal_Loop's
+ * per-slice poll turns into a debugger entry.  The parked BREAK is swallowed
+ * as a flag -- it is NEVER rewritten to MCPBREAKNOW (that rewrite lives on
+ * the recv-loop path this helper bypasses) -- so the next debugger entry's
+ * notify block (headless / TTY) still emits exactly one
+ * "BREAK\nEIP=..\nEBP=..\nEND\n" reply for the outstanding command.
+ * Non-BREAK bytes (e.g. the QUIT of a QUIT-while-RUN) stay unread.
+ *
+ * Lock discipline: the mutex is held only for the response_ready predicate
+ * and the timed wait itself; all socket I/O happens unlocked, so the main
+ * thread can always post the reply.  Only the socket thread ever waits. */
+static void mcp_wait_for_response(int client_fd, bool preempt_break) {
+    pthread_mutex_lock(&mcp_mutex);
+    while (!mcp_response_ready) {
+        pthread_mutex_unlock(&mcp_mutex);
+        if (preempt_break) {
+            /* Non-consuming poll: is a complete BREAK line waiting? */
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(client_fd, &rfds);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            if (select(client_fd + 1, &rfds, nullptr, nullptr, &tv) > 0 &&
+                FD_ISSET(client_fd, &rfds)) {
+                /* SEPARATE peek buffer -- never the outer linebuf. */
+                char peekbuf[16];
+                ssize_t pn = recv(client_fd, peekbuf, sizeof(peekbuf) - 1,
+                                  MSG_PEEK | MSG_DONTWAIT);
+                if (pn >= 6 && memcmp(peekbuf, "BREAK\n", 6) == 0) {
+                    /* Consume exactly the BREAK line, leave the rest. */
+                    size_t got = 0;
+                    char discard[6];
+                    while (got < 6) {
+                        ssize_t cn = recv(client_fd, discard + got, 6 - got, 0);
+                        if (cn <= 0) break;
+                        got += (size_t)cn;
+                    }
+                    if (got == 6) {
+                        /* Park as flag only: keep mcp_awaiting_break as-is;
+                         * touch nothing else (no mcp_cmd_ready /
+                         * mcp_pending_cmd / mcp_response_buf, no send). */
+                        mcp_break_pending = true;
+                    }
+                }
+                /* Anything else -- partial BREAK, QUIT, ... -- stays unread. */
+            }
+        }
+        pthread_mutex_lock(&mcp_mutex);
+        if (mcp_response_ready) break;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 75 * 1000 * 1000L;
+        if (ts.tv_nsec >= 1000 * 1000 * 1000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000 * 1000 * 1000L;
+        }
+        pthread_cond_timedwait(&mcp_resp_cv, &mcp_mutex, &ts);
+    }
+    /* Predicate true, mutex held: a BREAK parked above may be stale now (e.g.
+     * a normal breakpoint won the race and produced this reply) -- clear it
+     * so the NEXT run does not instantly phantom-break. */
+    mcp_break_pending = false;
+    pthread_mutex_unlock(&mcp_mutex);
+}
+
 /* ---------------------------------------------------------------------------
  * MCP socket server — listens on a Unix domain socket, accepts one client at
  * a time, and bridges newline-delimited debugger commands to/from the main
@@ -6734,9 +6809,8 @@ static void* mcp_server_thread(void* arg) {
 
                     mcp_break_pending = true;  /* volatile: visible to main thread */
 
+                    mcp_wait_for_response(client_fd, true /*preempt_break*/);
                     pthread_mutex_lock(&mcp_mutex);
-                    while (!mcp_response_ready)
-                        pthread_cond_wait(&mcp_resp_cv, &mcp_mutex);
                     std::string resp = mcp_response_buf;
                     pthread_mutex_unlock(&mcp_mutex);
                     send(client_fd, resp.c_str(), resp.size(), MSG_NOSIGNAL);
@@ -6752,9 +6826,8 @@ static void* mcp_server_thread(void* arg) {
                 pthread_mutex_unlock(&mcp_mutex);
 
                 /* wait for response (filled by main thread or break handler) */
+                mcp_wait_for_response(client_fd, true /*preempt_break*/);
                 pthread_mutex_lock(&mcp_mutex);
-                while (!mcp_response_ready)
-                    pthread_cond_wait(&mcp_resp_cv, &mcp_mutex);
                 std::string resp = mcp_response_buf;
                 pthread_mutex_unlock(&mcp_mutex);
 

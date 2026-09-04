@@ -525,6 +525,16 @@ static Bitu Normal_Loop(void) {
 #if C_DEBUG
                 if (DEBUG_ExitLoop())
                     return 0;
+                /* MCP force_break: poll the socket thread's soft-break flag on
+                 * every CPU slice, so a BREAK parked while a RUN is outstanding
+                 * preempts even a tight guest loop that never traps to a
+                 * callback.  One volatile load per slice; the entry check above
+                 * covers loop re-entry, this covers the inner pump. */
+                if (GCC_UNLIKELY(mcp_break_pending)) {
+                    mcp_break_pending = false;
+                    DEBUG_EnableDebugger();
+                    return 0;
+                }
 #endif
             } else {
                 GFX_Events();
