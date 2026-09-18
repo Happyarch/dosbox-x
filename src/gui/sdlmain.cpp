@@ -7832,6 +7832,7 @@ void SBLASTER_Init();
 void GUS_Init();
 void IMFC_Init();
 void INNOVA_Init();
+void PAS_Init();
 void PCSPEAKER_Init();
 void TANDYSOUND_Init();
 void DISNEY_Init();
@@ -9788,6 +9789,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         IDE_Init();
         IMFC_Init();
         INNOVA_Init();
+        PAS_Init();
         BIOS_Init();
         INT10_Init();
         SERIAL_Init();

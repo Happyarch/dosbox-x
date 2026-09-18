@@ -16,19 +16,21 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Pro Audio Spectrum 16 emulation (stage 3: DMA/IRQ/PIT plumbing).
+/* Pro Audio Spectrum 16 emulation (stage 4: static bring-up).
  *
  * Knowledge sources: the authors of 86Box's snd_pas16.c and the Linux
  * kernel OSS PAS16 documentation. Hardware behavior is re-expressed here
  * in this fork's house style; no code is copied from those sources.
  *
  * Stage 2 modeled the base-relative register file and the MV508 mixer
- * state. Stage 3 wires the side effects: the guest IRQ line via the
+ * state. Stage 3 wired the side effects: the guest IRQ line via the
  * fork PIC_* calls, sample flow via the fork DMA channel reads driven
  * by a re-expressed 1388-138B rate/count window, and the card-side OPL
- * and MPU routing decisions. Every behavioral block is re-derived;
- * points that need cross-file APIs or hardware measurement stay marked
- * STAGE4 below.
+ * and MPU routing decisions. Stage 4 (static) instantiates the card
+ * from sdlmain beside INNOVA_Init and validates the bring-up sequence
+ * against the oracle without executing the emulator. Every behavioral
+ * block is re-derived; points that need cross-file APIs or hardware
+ * measurement stay marked STAGE4 below.
  */
 
 #include <string.h>
@@ -92,11 +94,14 @@ static const double pas_master_1db[64] = {
 /* Stage 2: DMA select map from 86Box snd_pas16.c, re-expressed. */
 static const Bitu pas_dma_map[8] = {4, 1, 2, 3, 0, 5, 6, 7};
 
-/* Stage 3: card PIT clock for the 1388-138B rate/count window,
+/* Stage 4: card PIT clock for the 1388-138B rate/count window,
  * re-expressed from the hardware note the oracle carries in its own
  * header (card clocked at 1193180 Hz). The prescaler register divides
- * that clock when native mode and a nonzero prescaler select it; the
- * exact scaled curve is a STAGE4 measurement item. */
+ * that clock when native mode and a nonzero prescaler select it. The
+ * exact scaled curve is undetermined from the available sources: the
+ * oracle delegates it to its own PIT module outside the reference
+ * file, and the kernel doc carries no clock data, so the divide model
+ * stands pending hardware measurement. */
 static const double PAS_PIT_CLOCK = 1193180.0;
 
 /* Stage 3: sample-pump chunking, following the house precedent of
@@ -243,10 +248,10 @@ static void PAS_UpdateMidiIRQ(void) {
 		PAS_EvalIRQ();
 }
 
-/* Stage 3: effective card clock, re-expressed from the oracle clock
+/* Stage 4: effective card clock, re-expressed from the oracle clock
  * select (native-mode bit at 8000 plus a nonzero prescaler picks the
- * divided clock). The prescaler divides; the exact scaled curve stays
- * a STAGE4 measurement item. */
+ * divided clock). The exact scaled curve stays undetermined (see the
+ * PAS_PIT_CLOCK note); the divide model stands. */
 static void PAS_UpdateClock(void) {
 	pas.pitClock = PAS_PIT_CLOCK;
 	if ((pas.sysConf[0] & 0x02) && pas.prescale)
@@ -302,8 +307,9 @@ static void PAS_DMA_Callback(DmaChannel *chan, DMAEvent event) {
 	PAS_PumpUpdate();
 }
 
-/* Stage 3: pump arming. PIO mode (PCM on but DMA enable clear) has no
- * sample path yet and stays silent; that half is STAGE4. */
+/* Stage 4: pump arming. PIO mode (PCM on but DMA enable clear) stays
+ * silent by design: the oracle stores no sample on F88/F89 writes
+ * (buffer-flush no-ops), so there is no PIO path to model. */
 static bool PAS_PumpWanted(void) {
 	if (!(pas.pcmCtrl & PAS_PCM_ENABLE)) return false;
 	if (!(pas.pcmCtrl & PAS_PCM_DMA)) return false;
@@ -723,14 +729,17 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		PAS_EvalIRQ();
 		break;
 	case 0x0802: {
-		/* Stage 3: B8A filter control, re-expressed from the oracle
+		/* Stage 4: B8A filter control, re-expressed from the oracle
 		 * PAS16 path. Bit 7 gates counter 1, bit 6 gates counter 0;
 		 * the half-toggle and flip-flop restart with the engine. The
 		 * rising-mute mask/status clear lives on the old-PAS path
-		 * only, so the PAS16 path stores the byte as-is. Filter
-		 * coefficients for the filter path stay deferred (STAGE4):
-		 * the fork mixer consumes channel output directly, so no
-		 * resample stage needs them yet. */
+		 * only, so the PAS16 path stores the byte as-is. The cutoff
+		 * table matches the oracle values. Filter coefficients stay
+		 * deferred (STAGE4): the oracle builds a runtime
+		 * Blackman-windowed-sinc FIR per cutoff against the host
+		 * rate, which is new DSP code rather than data, and the fork
+		 * mixer consumes channel output directly, so no resample
+		 * stage needs them yet. */
 		pas.pitGate[1] = (v & 0x80) != 0;
 		pas.pitGate[0] = (v & 0x40) != 0;
 		pas.stereoHalf = 0;
@@ -761,8 +770,10 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		PAS_EvalIRQ();
 		break;
 	case 0x0c00: case 0x0c01:
-		/* Stage 3: F88/F89 PIO writes carry no sample path; the DMA
-		 * engine above is the only sample source, PIO is STAGE4. */
+		/* Stage 4: F88/F89 PIO writes carry no sample path, matching
+		 * the oracle (its writes flush the mixer buffer only and
+		 * store nothing); the DMA engine above is the only sample
+		 * source. */
 		break;
 	case 0x0c02:
 		/* Stage 3: F8A PCM control with enable-edge reset, re-expressed
@@ -860,20 +871,22 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		pas.ioConf[3] = v;
 		break;
 	case 0xf400:
-		/* Stage 3: compat enables, re-expressed from the oracle
+		/* Stage 4: compat enables, re-expressed from the oracle
 		 * compat path (bit 1 enables the SB side, bit 0 the MPU
 		 * side). The enables are state only: driving the live fork
 		 * SB/MPU devices needs cross-file address hooks that do not
-		 * exist yet (STAGE4, owned by those files). */
+		 * exist yet (STAGE4, owned by those files; the oracle
+		 * re-addresses its SB/MPU devices on every F400/F401
+		 * write, which is the behavior the hooks must replay). */
 		pas.compat = v & 0xf3;
 		pas.sbOn = (v & 0x02) != 0;
 		pas.mpuOn = (v & 0x01) != 0;
 		break;
 	case 0xf401:
-		/* Stage 3: compat bases, re-expressed from the oracle base
+		/* Stage 4: compat bases, re-expressed from the oracle base
 		 * derivation (low nibble picks the 0x2x0 SB base, high
 		 * nibble the 0x3x0 MPU base). Stored; live remap is the
-		 * same STAGE4 item as above. */
+		 * same STAGE4 item as above, replayed on every write. */
 		pas.compatBase = v;
 		pas.sbBase = 0x200 + (((Bitu)v & 0x0f) << 4);
 		pas.mpuBase = 0x300 + ((Bitu)v & 0xf0);
@@ -995,11 +1008,11 @@ public:
 		WriteHandler[14].Install(pas.basePort + 0xfc03, pas_write, IO_MB);
 		ReadHandler[h].Install(pas.basePort + 0x1000, pas_pit_read, IO_MB, 4); h++;
 		WriteHandler[15].Install(pas.basePort + 0x1000, pas_pit_write, IO_MB, 4);
-		/* NOTE: OPL aliases (base+0x0000) are NOT installed here, by
-		 * decision. The card carries an OPL3, but this fork already
-		 * serves 0x388-0x38B from its shared OPL emulation, and the
-		 * default PAS base is 0x388, so the alias window coincides
-		 * with it (SB-style: the card owns no FM, the shared
+		/* Stage 4 NOTE: OPL aliases (base+0x0000) are NOT installed
+		 * here, by decision. The card carries an OPL3, but this fork
+		 * already serves 0x388-0x38B from its shared OPL emulation,
+		 * and the default PAS base is 0x388, so the alias window
+		 * coincides with it (SB-style: the card owns no FM, the shared
 		 * emulation does). A non-default base would need forwarder
 		 * hooks into the OPL module, which has none to offer today
 		 * (STAGE4, owned by that module). Likewise the MV508 FM
@@ -1032,8 +1045,10 @@ void PAS_OnReset(Section *sec) {
 	}
 }
 
-void PAS_Init(Section* sec) {
-    (void)sec;//UNUSED
+/* Stage 4: no-arg instantiation entry in the INNOVA_Init house
+ * pattern: sdlmain calls this once; allocation happens on reset via
+ * PAS_OnReset. */
+void PAS_Init() {
 	LOG(LOG_MISC,LOG_DEBUG)("Initializing PAS emulation");
 
 	AddExitFunction(AddExitFunctionFuncPair(PAS_ShutDown),true);
