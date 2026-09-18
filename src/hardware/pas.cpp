@@ -16,26 +16,34 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Pro Audio Spectrum 16 emulation (stage 2: register file + MV508 mixer).
+/* Pro Audio Spectrum 16 emulation (stage 3: DMA/IRQ/PIT plumbing).
  *
  * Knowledge sources: the authors of 86Box's snd_pas16.c and the Linux
  * kernel OSS PAS16 documentation. Hardware behavior is re-expressed here
  * in this fork's house style; no code is copied from those sources.
  *
- * Stage 2 models the base-relative register file and the MV508 mixer
- * state. There is no sample flow yet: DMA/IRQ/PIT wiring, OPL routing
- * and MPU routing arrive in stage 3, so every side effect that needs
- * those APIs is stored as state now and marked STAGE3 below.
+ * Stage 2 modeled the base-relative register file and the MV508 mixer
+ * state. Stage 3 wires the side effects: the guest IRQ line via the
+ * fork PIC_* calls, sample flow via the fork DMA channel reads driven
+ * by a re-expressed 1388-138B rate/count window, and the card-side OPL
+ * and MPU routing decisions. Every behavioral block is re-derived;
+ * points that need cross-file APIs or hardware measurement stay marked
+ * STAGE4 below.
  */
 
 #include <string.h>
 #include "dosbox.h"
+#include "dma.h"
 #include "inout.h"
 #include "logging.h"
 #include "mixer.h"
 #include "pic.h"
 #include "setup.h"
 #include "control.h"
+
+/* Stage 3: host MIDI transmit, following the house pattern of a local
+ * forward declaration (as in the fork MPU handler). */
+void MIDI_RawOutByte(uint8_t data);
 
 /* Stage 2: MV508 attenuation curves, re-expressed as plain data.
  * Behavior per 86Box snd_pas16.c mixer tables (2 dB steps for channel
@@ -84,14 +92,31 @@ static const double pas_master_1db[64] = {
 /* Stage 2: DMA select map from 86Box snd_pas16.c, re-expressed. */
 static const Bitu pas_dma_map[8] = {4, 1, 2, 3, 0, 5, 6, 7};
 
+/* Stage 3: card PIT clock for the 1388-138B rate/count window,
+ * re-expressed from the hardware note the oracle carries in its own
+ * header (card clocked at 1193180 Hz). The prescaler register divides
+ * that clock when native mode and a nonzero prescaler select it; the
+ * exact scaled curve is a STAGE4 measurement item. */
+static const double PAS_PIT_CLOCK = 1193180.0;
+
+/* Stage 3: sample-pump chunking, following the house precedent of
+ * pumping several samples per PIC event instead of one event per
+ * sample. 5 ms events cover rates up to about 51 kHz. */
+#define PAS_PUMP_MAX 256
+#define PAS_PUMP_INTERVAL_MS 5.0
+
 static struct {
 	bool enabled;
 	Bitu basePort;
-	Bitu irq;
+	/* Stage 3: signed IRQ line. Nibble 0 programs no line, which the
+	 * oracle models as -1; stage 2 stored the converter output into an
+	 * unsigned and wrapped, so every PIC call must have guarded it.
+	 * Holding -1 for none resolves that flag. */
+	int irq;
 	Bitu dma;
 	Bitu rate;
-	/* Stage 2 register file (PAS16 read/write behavior per 86Box
-	 * snd_pas16.c; DMA/IRQ/PIT effects deferred to stage 3). */
+	/* Stage 3 register file (PAS16 behavior re-expressed; DMA/IRQ/PIT
+	 * side effects wired below). */
 	uint8_t mixerCtrl;	/* B88: mixer-control latch */
 	uint8_t irqStatus;	/* B89: pending IRQs, clear-on-write-1 */
 	uint8_t irqMask;		/* B8B: enabled IRQs (low 5 bits) */
@@ -99,22 +124,22 @@ static struct {
 	bool filterOn;		/* low 5 bits hit a known cutoff */
 	Bitu filterCutoff;	/* selected cutoff in Hz, 0 when off */
 	uint8_t pcmCtrl;		/* F8A: mono/stereo + enable bits */
-	uint8_t stereoHalf;	/* stereo L/R toggle (DMA engine, stage 3) */
-	bool dmaFlip;		/* 8-bit sample flip-flop (DMA engine, stage 3) */
+	uint8_t stereoHalf;	/* stereo L/R toggle (DMA engine) */
+	bool dmaFlip;		/* 8-bit sample flip-flop (DMA engine) */
 	uint8_t waitStates;	/* BC00 */
 	uint8_t prescale;		/* BC02: PIT prescaler (stage 3 clock) */
 	uint8_t sysConf[4];	/* 8000-8003: system config nibbles */
 	uint8_t ioConf[4];	/* F000-F003: IO/DMA/IRQ config */
-	uint8_t compat;		/* F400: SB/MPU compat enables (side effects stage 3) */
-	uint8_t compatBase;	/* F401: SB compat base nibbles */
-	uint8_t sbIrqDma;		/* F802: SB IRQ/DMA select (side effects stage 3) */
+	uint8_t compat;		/* F400: SB/MPU compat enables (state only) */
+	uint8_t compatBase;	/* F401: SB/MPU compat base nibbles */
+	uint8_t sbIrqDma;		/* F802: SB IRQ/DMA select (stored, no SB side) */
 	uint8_t midiCtrl;		/* 1401/1403: UART control */
 	uint8_t midiStat;		/* 1800: UART status */
 	uint8_t midiFifo;		/* 1801: FIFO status */
 	uint8_t midiData;		/* 1402/1802: UART data byte */
 	bool midiUartIn;
 	bool midiUartOut;
-	uint8_t midiQueue[256];	/* receive queue, empty until stage 3 MIDI in */
+	uint8_t midiQueue[256];	/* receive queue (host MIDI-in is STAGE4) */
 	uint8_t midiR;
 	uint8_t midiW;
 	/* Stage 2 MV508 mixer (recalc/reset behavior per 86Box snd_pas16.c). */
@@ -127,7 +152,33 @@ static struct {
 	uint8_t bass;		/* 4-bit tone, 6 is flat */
 	uint8_t treble;
 	MixerChannel *chan;
+	/* Stage 3: DMA/IRQ/PIT plumbing state, re-expressed from the
+	 * oracle PCM/DMA engine behavior. */
+	DmaChannel *dmachan;	/* attached fork channel, NULL when none */
+	bool dmaMasked;		/* guest masked the channel or TC fired */
+	bool dmaTC;		/* terminal count seen: reads go dry */
+	uint16_t dmaHold;	/* half-word hold for 8-bit on wide channel */
+	bool sampDry;		/* current sample instant found no data */
+	int16_t pcmL;		/* held outputs (compat stereo keeps a side) */
+	int16_t pcmR;
+	uint16_t pitCount[2];	/* 1388/1389 divisor image, counters 0/1 */
+	uint8_t pitMode[2];	/* 138B control mode field per counter */
+	uint8_t pitAccess[2];	/* 138B access field per counter */
+	uint8_t pitNeed[2];	/* divisor byte assembly: 0 wants LSB */
+	bool pitSet[2];		/* divisor fully programmed at least once */
+	bool pitGate[2];	/* B8A bit 6 -> counter 0, bit 7 -> counter 1 */
+	bool pitReadHi[2];	/* read interleave tracker */
+	int32_t ctr1pos;	/* counter-1 cascade countdown (PCM IRQ) */
+	double pitClock;	/* effective card clock after prescaler */
+	bool pumpOn;		/* sample pump event is armed */
+	Bitu sbBase;		/* F401-derived SB compat base (state only) */
+	Bitu mpuBase;		/* F401-derived MPU compat base (state only) */
+	bool sbOn;		/* F400 SB compat enable (state only) */
+	bool mpuOn;		/* F400 MPU compat enable (state only) */
 } pas;
+
+static void PAS_PumpUpdate(void);
+static void PAS_PumpTick(Bitu val);
 
 /* Stage 2: recompute MV508 gains from the register image.
  * Behavior per 86Box snd_pas16.c mv508 recalc; re-expressed. */
@@ -159,24 +210,263 @@ static void PAS_MixerReset(void) {
 	PAS_MixerRecalc();
 }
 
-/* Stage 2: PCM engine state reset (no PIC/DMA calls yet; stage 3).
- * Behavior per 86Box snd_pas16.c PCM reset; re-expressed. */
+/* Stage 3: guest IRQ line, counter-piece of the oracle raise/clear
+ * pair. The line follows the pending low-5 status bits; every entry
+ * point that changes status or mask re-evaluates. The no-line case
+ * (nibble 0, irq -1) never touches the fork PIC. Pending low-5 bits
+ * are always mask-enabled here: the mask write strips disabled bits
+ * and every raise checks the mask first, matching the oracle order. */
+static void PAS_EvalIRQ(void) {
+	if (pas.irq == -1) return;
+	if (pas.irqStatus & 0x1f)
+		PIC_ActivateIRQ((Bitu)pas.irq);
+	else
+		PIC_DeActivateIRQ((Bitu)pas.irq);
+}
+
+static void PAS_RaiseIRQ(Bitu bits) {
+	pas.irqStatus |= (uint8_t)bits;
+	if (pas.irq == -1) return;
+	if (pas.irqStatus & pas.irqMask & (uint8_t)bits)
+		PIC_ActivateIRQ((Bitu)pas.irq);
+}
+
+/* Stage 3: MIDI IRQ condition, re-expressed from the oracle MIDI
+ * update helper. UART-out requests with status bits 3/4, UART-in with
+ * status bit 2; the bit itself clears only via B89/B8B/reset. */
+static void PAS_UpdateMidiIRQ(void) {
+	if (pas.midiUartOut && (pas.midiStat & 0x18))
+		PAS_RaiseIRQ(PAS_IRQ_MIDI);
+	else if (pas.midiUartIn && (pas.midiStat & 0x04))
+		PAS_RaiseIRQ(PAS_IRQ_MIDI);
+	else
+		PAS_EvalIRQ();
+}
+
+/* Stage 3: effective card clock, re-expressed from the oracle clock
+ * select (native-mode bit at 8000 plus a nonzero prescaler picks the
+ * divided clock). The prescaler divides; the exact scaled curve stays
+ * a STAGE4 measurement item. */
+static void PAS_UpdateClock(void) {
+	pas.pitClock = PAS_PIT_CLOCK;
+	if ((pas.sysConf[0] & 0x02) && pas.prescale)
+		pas.pitClock = PAS_PIT_CLOCK / (double)pas.prescale;
+	PAS_PumpUpdate();
+}
+
+/* Stage 3: programmed sample rate from the counter-0 divisor. An
+ * 8254 divisor of 0 means 65536; unprogrammed means silent. */
+static double PAS_SampleRate(void) {
+	if (!pas.pitSet[0]) return 0.0;
+	Bitu div = pas.pitCount[0] ? pas.pitCount[0] : 65536;
+	return pas.pitClock / (double)div;
+}
+
+/* Stage 3: DMA channel attach, following the house pattern (release
+ * the old channel callback, take the new channel, register for
+ * mask/unmask/terminal-count). Map value 4 is the cascade slot, which
+ * carries no channel. Registration replays the current mask state
+ * into the callback, so dmaMasked is fresh afterwards. */
+static void PAS_DMA_Callback(DmaChannel *chan, DMAEvent event);
+
+static void PAS_AttachDMA(void) {
+	if (pas.dmachan != NULL) {
+		pas.dmachan->Register_Callback(NULL);
+		pas.dmachan = NULL;
+	}
+	pas.dmaMasked = true;
+	pas.dmaTC = false;
+	if (pas.dma == 4) {
+		PAS_PumpUpdate();
+		return;
+	}
+	DmaChannel *ch = GetDMAChannel((uint8_t)pas.dma);
+	if (ch == NULL) {
+		PAS_PumpUpdate();
+		return;
+	}
+	pas.dmachan = ch;
+	pas.dmachan->Register_Callback(PAS_DMA_Callback);
+	PAS_PumpUpdate();
+}
+
+static void PAS_DMA_Callback(DmaChannel *chan, DMAEvent event) {
+	if (chan != pas.dmachan) return;
+	if (event == DMA_MASKED)
+		pas.dmaMasked = true;
+	else if (event == DMA_UNMASKED) {
+		pas.dmaMasked = false;
+		pas.dmaTC = false;
+	} else if (event == DMA_REACHED_TC)
+		pas.dmaTC = true;
+	PAS_PumpUpdate();
+}
+
+/* Stage 3: pump arming. PIO mode (PCM on but DMA enable clear) has no
+ * sample path yet and stays silent; that half is STAGE4. */
+static bool PAS_PumpWanted(void) {
+	if (!(pas.pcmCtrl & PAS_PCM_ENABLE)) return false;
+	if (!(pas.pcmCtrl & PAS_PCM_DMA)) return false;
+	if (!pas.pitGate[0]) return false;
+	if (!pas.pitSet[0]) return false;
+	if (pas.dmachan == NULL) return false;
+	if (pas.dmaMasked || pas.dmaTC) return false;
+	return true;
+}
+
+static void PAS_PumpUpdate(void) {
+	PIC_RemoveEvents(PAS_PumpTick);
+	pas.pumpOn = PAS_PumpWanted();
+	if (pas.chan != NULL)
+		pas.chan->Enable(pas.pumpOn);
+	if (pas.pumpOn)
+		PIC_AddEvent(PAS_PumpTick, PAS_PUMP_INTERVAL_MS);
+}
+
+/* Stage 3: DMA sample readers, re-expressed from the oracle
+ * word/half-word walk. Narrow channels (0-3) move bytes, wide ones
+ * (5-7) move words, and an 8-bit sample on a wide channel consumes
+ * half a word per tick through the flip-flop. A short fork read means
+ * the channel ran dry: flag it, and the tick renders silence with no
+ * IRQ, as the oracle zero-fill path does. Width and sign handling
+ * follow the 8001 system-config bits: bit 2 selects 16-bit, bit 3
+ * masks 12-bit, bit 4 inverts the MSB. */
+static uint8_t PAS_ReadByte(void) {
+	uint8_t b = 0;
+	if (pas.dmachan->Read(1, &b) != 1) {
+		pas.sampDry = true;
+		return 0;
+	}
+	return b;
+}
+
+static uint16_t PAS_ReadSamp8(void) {
+	uint16_t w;
+	if (pas.dma >= 5) {
+		if (!pas.dmaFlip) {
+			uint8_t b[2] = {0, 0};
+			if (pas.dmachan->Read(2, b) != 2) {
+				pas.sampDry = true;
+				return 0;
+			}
+			pas.dmaHold = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+		}
+		w = pas.dmaFlip ? (pas.dmaHold >> 8) : (pas.dmaHold & 0xff);
+		pas.dmaFlip = !pas.dmaFlip;
+	} else {
+		w = PAS_ReadByte();
+	}
+	return (uint16_t)((w ^ 0x80) << 8);
+}
+
+static uint16_t PAS_ReadSamp16(int *clocks) {
+	uint16_t w;
+	if (pas.dma >= 5) {
+		uint8_t b[2] = {0, 0};
+		if (pas.dmachan->Read(2, b) != 2) {
+			pas.sampDry = true;
+			return 0;
+		}
+		w = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+		*clocks = 1;
+	} else {
+		uint8_t lo = PAS_ReadByte();
+		uint8_t hi = PAS_ReadByte();
+		w = (uint16_t)(lo | ((uint16_t)hi << 8));
+		*clocks = 2;
+	}
+	if (pas.sysConf[1] & 0x08)
+		w &= 0xfff0;
+	if (pas.sysConf[1] & 0x10)
+		w ^= 0x8000;
+	return w;
+}
+
+/* Stage 3: one sample instant, re-expressed from the oracle counter-0
+ * tick. Mono fans one read to both sides; native stereo (8000 bit 1)
+ * reads a fresh pair; compat stereo alternates halves and mirrors the
+ * half into status bit 5. The counter-1 cascade follows the oracle
+ * word-clock rule: 8-bit instants do not advance it, 16-bit instants
+ * advance it per word consumed, and reaching zero reloads and raises
+ * the PCM IRQ. The sample IRQ goes out once per instant. Both IRQs
+ * stay subject to the counter-1 rate mode the drivers program. */
+static void PAS_Timer0Step(int16_t *out) {
+	pas.sampDry = false;
+	bool wide16 = (pas.sysConf[1] & 0x04) != 0;
+	int clocks = 0;
+	if (pas.pcmCtrl & PAS_PCM_MONO) {
+		uint16_t t = wide16 ? PAS_ReadSamp16(&clocks) : PAS_ReadSamp8();
+		pas.pcmL = pas.pcmR = (int16_t)t;
+	} else if (pas.sysConf[0] & 0x02) {
+		uint16_t l = wide16 ? PAS_ReadSamp16(&clocks) : PAS_ReadSamp8();
+		int more = 0;
+		uint16_t r = wide16 ? PAS_ReadSamp16(&more) : PAS_ReadSamp8();
+		clocks += more;
+		pas.pcmL = (int16_t)l;
+		pas.pcmR = (int16_t)r;
+	} else {
+		uint16_t t = wide16 ? PAS_ReadSamp16(&clocks) : PAS_ReadSamp8();
+		if (pas.stereoHalf)
+			pas.pcmR = (int16_t)t;
+		else
+			pas.pcmL = (int16_t)t;
+		pas.stereoHalf ^= 1;
+		pas.irqStatus = (uint8_t)((pas.irqStatus & 0xdf) | (pas.stereoHalf << 5));
+	}
+	if (pas.sampDry) {
+		out[0] = out[1] = 0;
+		return;
+	}
+	out[0] = pas.pcmL;
+	out[1] = pas.pcmR;
+	if (clocks > 0 && pas.pitGate[1] && pas.pitSet[1]) {
+		pas.ctr1pos -= clocks;
+		while (pas.ctr1pos <= 0) {
+			pas.ctr1pos += pas.pitCount[1] ? pas.pitCount[1] : 65536;
+			if (pas.pitMode[1] & 0x02)
+				PAS_RaiseIRQ(PAS_IRQ_PCM);
+		}
+	}
+	if (pas.pitMode[1] & 0x02)
+		PAS_RaiseIRQ(PAS_IRQ_SAMP);
+}
+
+static void PAS_PumpTick(Bitu /*val*/) {
+	if (!pas.pumpOn || pas.chan == NULL) return;
+	double rate = PAS_SampleRate();
+	Bitu n = (Bitu)(rate * (PAS_PUMP_INTERVAL_MS / 1000.0) + 0.5);
+	if (n < 1) n = 1;
+	if (n > PAS_PUMP_MAX) n = PAS_PUMP_MAX;
+	static int16_t buf[PAS_PUMP_MAX * 2];
+	for (Bitu i = 0; i < n; i++)
+		PAS_Timer0Step(&buf[i * 2]);
+	pas.chan->AddSamples_s16(n, buf);
+	if (pas.pumpOn)
+		PIC_AddEvent(PAS_PumpTick, PAS_PUMP_INTERVAL_MS);
+}
+
+/* Stage 3: PCM engine reset, re-expressed from the oracle PCM
+ * reset. Clearing the enable stops the pump; the line follows. */
 static void PAS_ResetPCM(void) {
 	pas.pcmCtrl = 0x00;
 	pas.stereoHalf = 0;
 	pas.irqStatus &= 0xd7;
-	/* STAGE3: clear the guest IRQ line if nothing is pending. */
+	PAS_EvalIRQ();
+	PAS_PumpUpdate();
 }
 
-/* Stage 2: register-file reset, minus PIT/PIC/IO effects (stage 3).
- * Behavior per 86Box snd_pas16.c register reset; re-expressed. */
+/* Stage 3: register-file reset, re-expressed from the oracle common
+ * reset. Gates drop, the clock returns to standard, and the pump and
+ * line follow. Counter divisors are NOT cleared: the guest reprograms
+ * them, and the set flags keep a stale rate from restarting the pump
+ * only until the gates reopen it. */
 static void PAS_ResetRegs(void) {
-	/* STAGE3: clear the guest IRQ line here. */
 	pas.sysConf[0] &= 0xfd;
 	pas.sysConf[1] = 0x00;
 	pas.sysConf[2] = 0x00;
 	pas.prescale = 0x00;
-	/* STAGE3: restore the PIT constant and gate counters 0/1 off. */
+	pas.pitClock = PAS_PIT_CLOCK;
+	pas.pitGate[0] = pas.pitGate[1] = false;
 	pas.filterCtrl = 0x00;
 	pas.filterOn = false;
 	pas.filterCutoff = 0;
@@ -185,10 +475,15 @@ static void PAS_ResetRegs(void) {
 	pas.irqMask = 0x00;
 	pas.irqStatus = 0x00;
 	PAS_MixerReset();
+	PAS_EvalIRQ();
+	PAS_PumpUpdate();
 }
 
 static int PAS_IrqConvert(Bitu val) {
-	/* Stage 2: nibble-to-IRQ map per 86Box snd_pas16.c; re-expressed. */
+	/* Stage 3: nibble-to-IRQ map, re-expressed from the oracle
+	 * converter. Nibble 0 means no line (-1); the result is stored
+	 * in the signed pas.irq, which resolves the stage-2 wrap flag
+	 * (the -1 used to land in an unsigned). */
 	int irq = (int)(val & 0x0f);
 	if (irq == 0) return -1;
 	if (irq <= 6) return irq + 1;
@@ -219,6 +514,68 @@ static void PAS_MixerWrite(Bitu val) {
 		pas.mixRegs[bank][(pas.mixIndex | PAS_MIX_RIGHT) & 0x7f] = (uint8_t)(val & mask);
 	}
 	PAS_MixerRecalc();
+}
+
+/* Stage 3: 1388-138B rate/count window, re-expressed from the
+ * oracle PIT attachment. The fork has no per-card PIT device to
+ * attach, so the window is modeled here as an 8254-style counter pair:
+ * 138B takes control words (counter select, access, mode), 1388/1389
+ * assemble the counter-0/1 divisors LSB-then-MSB, and 138A (counter 2)
+ * is stored nowhere. Reads return the stored divisor image LSB/MSB in
+ * turn; the control port reads back open-bus. A completed divisor or
+ * gate change re-arms the sample pump. Counter modes default to the
+ * rate-generator shape the drivers program until the guest writes
+ * control. */
+static Bitu pas_pit_read(Bitu port, Bitu iolen) {
+	(void)iolen;//UNUSED
+	Bitu off = port - (pas.basePort + 0x1000);
+	if (off > 3) return 0xff;
+	if (off == 3 || off == 2) return 0xff;
+	uint16_t v = pas.pitCount[off];
+	if (!pas.pitReadHi[off]) {
+		pas.pitReadHi[off] = true;
+		return v & 0xff;
+	}
+	pas.pitReadHi[off] = false;
+	return (v >> 8) & 0xff;
+}
+
+static void pas_pit_write(Bitu port, Bitu val, Bitu iolen) {
+	(void)iolen;//UNUSED
+	Bitu off = port - (pas.basePort + 0x1000);
+	if (off > 3) return;
+	uint8_t v = (uint8_t)val;
+	if (off == 3) {
+		Bitu c = (v >> 6) & 3;
+		if (c > 1) return;
+		Bitu access = (v >> 4) & 3;
+		if (access == 0) return;
+		pas.pitMode[c] = (uint8_t)((v >> 1) & 7);
+		pas.pitAccess[c] = (uint8_t)access;
+		pas.pitNeed[c] = (access == 2) ? 1 : 0;
+		pas.pitReadHi[c] = false;
+		return;
+	}
+	if (off == 2) return;
+	Bitu c = off;
+	if (pas.pitNeed[c] == 0) {
+		if (pas.pitAccess[c] == 2) {
+			pas.pitCount[c] = (uint16_t)((pas.pitCount[c] & 0x00ff) | ((uint16_t)v << 8));
+		} else {
+			pas.pitCount[c] = (uint16_t)((pas.pitCount[c] & 0xff00) | v);
+			if (pas.pitAccess[c] == 3) {
+				pas.pitNeed[c] = 1;
+				return;
+			}
+		}
+	} else {
+		pas.pitCount[c] = (uint16_t)((pas.pitCount[c] & 0x00ff) | ((uint16_t)v << 8));
+		pas.pitNeed[c] = 0;
+	}
+	pas.pitSet[c] = true;
+	if (c == 1)
+		pas.ctr1pos = pas.pitCount[1] ? pas.pitCount[1] : 65536;
+	PAS_PumpUpdate();
 }
 
 static Bitu pas_read(Bitu port, Bitu iolen) {
@@ -259,8 +616,10 @@ static Bitu pas_read(Bitu port, Bitu iolen) {
 		ret = pas.midiCtrl;
 		break;
 	case 0x1402: case 0x1802:
-		/* Stage 2: UART data read; behavior per 86Box snd_pas16.c
-		 * (probe echo + empty queue); re-expressed. No MIDI flow yet. */
+		/* Stage 3: UART data read, re-expressed from the oracle
+		 * (probe echo + queue drain). The MIDI IRQ follows the
+		 * drained status; filling the queue from host MIDI-in is
+		 * STAGE4. */
 		ret = 0;
 		if (pas.midiUartIn) {
 			if ((pas.midiData == 0xaa) && (pas.midiCtrl & 0x04))
@@ -273,7 +632,7 @@ static Bitu pas_read(Bitu port, Bitu iolen) {
 				}
 			}
 			pas.midiStat &= ~0x04;
-			/* STAGE3: re-evaluate the MIDI IRQ here. */
+			PAS_UpdateMidiIRQ();
 		}
 		break;
 	case 0x1800:
@@ -306,8 +665,8 @@ static Bitu pas_read(Bitu port, Bitu iolen) {
 		ret = pas.ioConf[off - 0xf000];
 		break;
 	case 0xf400:
-		/* Stage 2: compat enables; live SB/MPU status bits arrive
-		 * with the stage 3 SB/MPU wiring. */
+		/* Stage 3: compat enables; the live SB/MPU devices keep
+		 * their own ports (state-only wiring, see the write side). */
 		ret = pas.compat & 0xf3;
 		break;
 	case 0xf401:
@@ -358,15 +717,22 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		}
 		break;
 	case 0x0801:
-		/* Stage 2: B89 clear-on-write-1; behavior per 86Box
-		 * snd_pas16.c; re-expressed (PIC clear is stage 3). */
+		/* Stage 3: B89 clear-on-write-1, re-expressed from the oracle
+		 * PAS16 path. The line drops when no low-5 bit stays pending. */
 		pas.irqStatus &= ~v;
+		PAS_EvalIRQ();
 		break;
 	case 0x0802: {
-		/* Stage 2: B8A filter control; behavior per 86Box snd_pas16.c
-		 * PAS16 path; re-expressed. PIT gate effects and FIR
-		 * coefficient rebuild are stage 3; mute/IRQ edge notes below. */
-		/* STAGE3: gate PIT counters (bit 7 -> ctr 1, bit 6 -> ctr 0). */
+		/* Stage 3: B8A filter control, re-expressed from the oracle
+		 * PAS16 path. Bit 7 gates counter 1, bit 6 gates counter 0;
+		 * the half-toggle and flip-flop restart with the engine. The
+		 * rising-mute mask/status clear lives on the old-PAS path
+		 * only, so the PAS16 path stores the byte as-is. Filter
+		 * coefficients for the filter path stay deferred (STAGE4):
+		 * the fork mixer consumes channel output directly, so no
+		 * resample stage needs them yet. */
+		pas.pitGate[1] = (v & 0x80) != 0;
+		pas.pitGate[0] = (v & 0x40) != 0;
 		pas.stereoHalf = 0;
 		pas.dmaFlip = false;
 		/* NOTE: the rising-mute IRQ clear in the oracle lives on the
@@ -383,32 +749,37 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		case 0x19: pas.filterOn = true; pas.filterCutoff = 5965; break;
 		default: break;
 		}
+		PAS_PumpUpdate();
 		break;
 	}
 	case 0x0803:
-		/* Stage 2: B8B IRQ mask; behavior per 86Box snd_pas16.c;
-		 * re-expressed (PIC clear is stage 3). */
+		/* Stage 3: B8B IRQ mask, re-expressed from the oracle PAS16
+		 * path. Disabled low-5 bits are stripped from status, then
+		 * the line follows what stays pending. */
 		pas.irqMask = v & 0x1f;
 		pas.irqStatus &= ((v & 0x1f) | 0xe0);
+		PAS_EvalIRQ();
 		break;
 	case 0x0c00: case 0x0c01:
-		/* Stage 2: F88/F89 writes carry no state; behavior per
-		 * 86Box snd_pas16.c (flush only, no sample path yet). */
+		/* Stage 3: F88/F89 PIO writes carry no sample path; the DMA
+		 * engine above is the only sample source, PIO is STAGE4. */
 		break;
 	case 0x0c02:
-		/* Stage 2: F8A PCM control with enable-edge reset; behavior
-		 * per 86Box snd_pas16.c code bit positions (0x20/0x40/0x80);
-		 * re-expressed. See report on the header/code mismatch. */
+		/* Stage 3: F8A PCM control with enable-edge reset, re-expressed
+		 * from the oracle enable edge. Arming or clearing the enable
+		 * re-evaluates the sample pump. */
 		if ((v & PAS_PCM_ENABLE) && !(pas.pcmCtrl & PAS_PCM_ENABLE)) {
 			pas.stereoHalf = 0;
 			pas.irqStatus &= 0xd7;
 			pas.dmaFlip = false;
 		}
 		pas.pcmCtrl = v;
+		PAS_PumpUpdate();
 		break;
 	case 0x1401: case 0x1403:
-		/* Stage 2: UART control + mode flags; behavior per 86Box
-		 * snd_pas16.c; re-expressed (MIDI routing is stage 3). */
+		/* Stage 3: UART control + mode flags, re-expressed from the
+		 * oracle MIDI path. The mode change re-evaluates the MIDI
+		 * IRQ on the PAS line. */
 		pas.midiCtrl = v;
 		if ((v & 0x60) == 0x60) {
 			pas.midiUartOut = false;
@@ -417,36 +788,38 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 			pas.midiUartIn = true;
 		else
 			pas.midiUartOut = true;
-		/* STAGE3: re-evaluate the MIDI IRQ here. */
+		PAS_UpdateMidiIRQ();
 		break;
 	case 0x1402: case 0x1802:
-		/* Stage 2: UART data store; transmit is stage 3. */
+		/* Stage 3: UART data store, re-expressed from the oracle
+		 * MIDI path. UART-out bytes reach the host MIDI device. */
 		pas.midiData = v;
+		if (pas.midiUartOut)
+			MIDI_RawOutByte(v);
 		break;
 	case 0x1800:
 		pas.midiStat = v;
-		/* STAGE3: re-evaluate the MIDI IRQ here. */
+		PAS_UpdateMidiIRQ();
 		break;
 	case 0x1801:
 		pas.midiFifo = v;
 		break;
 	case 0x8000:
-		/* Stage 2: system config 1 with reset-on-rise of the top
-		 * bits; behavior per 86Box snd_pas16.c; re-expressed
-		 * (PIT/IO re-hookup is stage 3, base is conf-fixed). */
+		/* Stage 3: system config 1 with reset-on-rise of the top
+		 * bits; the clock select follows (base stays conf-fixed). */
 		if ((v & 0xc0) && !(pas.sysConf[0] & 0xc0)) {
 			PAS_ResetRegs();
 			pas.sysConf[0] = 0x00;
 		} else
 			pas.sysConf[0] = v;
-		/* STAGE3: update the PIT clock select here. */
+		PAS_UpdateClock();
 		break;
 	case 0x8001:
 		pas.sysConf[1] = v;
 		break;
 	case 0x8002:
 		pas.sysConf[2] = v;
-		/* STAGE3: update the PIT clock select here. */
+		PAS_UpdateClock();
 		break;
 	case 0x8003:
 		pas.sysConf[3] = v;
@@ -457,7 +830,7 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		break;
 	case 0xbc02:
 		pas.prescale = v;
-		/* STAGE3: update the PIT clock select here. */
+		PAS_UpdateClock();
 		break;
 	case 0xf000:
 		/* Stage 2: joystick-enable bit stored; gameport remap is
@@ -465,31 +838,49 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 		pas.ioConf[0] = v;
 		break;
 	case 0xf001:
+		/* Stage 3: DMA select, re-expressed from the oracle select
+		 * path. The channel is re-attached (house pattern) and the
+		 * clock select follows, since the width feeds it. */
 		pas.ioConf[1] = v;
 		pas.dma = pas_dma_map[v & 0x07];
-		/* STAGE3: update the PIT clock select here. */
+		PAS_AttachDMA();
+		PAS_UpdateClock();
 		break;
 	case 0xf002:
-		/* Stage 2: PAS IRQ select stored via the nibble map; the
-		 * SCSI high nibble is out of scope (no SCSI side). */
+		/* Stage 3: PAS IRQ select via the nibble map; the SCSI high
+		 * nibble is out of scope (no SCSI side). The old line is
+		 * released first, then the new line follows pending state. */
 		pas.ioConf[2] = v;
-		/* STAGE3: clear the old guest IRQ line here. */
-		pas.irq = (Bitu)PAS_IrqConvert(v);
+		if (pas.irq != -1)
+			PIC_DeActivateIRQ((Bitu)pas.irq);
+		pas.irq = PAS_IrqConvert(v);
+		PAS_EvalIRQ();
 		break;
 	case 0xf003:
 		pas.ioConf[3] = v;
 		break;
 	case 0xf400:
-		/* Stage 2: compat enables stored masked; SB/MPU address
-		 * effects arrive with the stage 3 wiring. */
+		/* Stage 3: compat enables, re-expressed from the oracle
+		 * compat path (bit 1 enables the SB side, bit 0 the MPU
+		 * side). The enables are state only: driving the live fork
+		 * SB/MPU devices needs cross-file address hooks that do not
+		 * exist yet (STAGE4, owned by those files). */
 		pas.compat = v & 0xf3;
+		pas.sbOn = (v & 0x02) != 0;
+		pas.mpuOn = (v & 0x01) != 0;
 		break;
 	case 0xf401:
+		/* Stage 3: compat bases, re-expressed from the oracle base
+		 * derivation (low nibble picks the 0x2x0 SB base, high
+		 * nibble the 0x3x0 MPU base). Stored; live remap is the
+		 * same STAGE4 item as above. */
 		pas.compatBase = v;
-		/* STAGE3: derive the SB/MPU base addresses here. */
+		pas.sbBase = 0x200 + (((Bitu)v & 0x0f) << 4);
+		pas.mpuBase = 0x300 + ((Bitu)v & 0xf0);
 		break;
 	case 0xf802:
-		/* Stage 2: SB IRQ/DMA select stored; effect is stage 3. */
+		/* Stage 3: SB IRQ/DMA select is stored only; the plan keeps
+		 * the SB-DSP side out, so there is nothing to drive. */
 		pas.sbIrqDma = v;
 		break;
 	default:
@@ -499,7 +890,9 @@ static void pas_write(Bitu port, Bitu val, Bitu iolen) {
 	}
 }
 
-/* Stage 2: silent mixer callback; the sample pump arrives in stage 3. */
+/* Stage 3: mixer pull callback. The sample pump pushes decoded DMA
+ * bytes via AddSamples; this fills any remainder with silence so the
+ * channel stays gapless while the pump is idle. */
 static void PAS_Callback(Bitu len) {
 	if (!len || pas.chan == NULL) return;
 	pas.chan->AddSilence();
@@ -510,12 +903,22 @@ public:
 	IO_ReadHandleObject ReadHandler[16];
 	IO_WriteHandleObject WriteHandler[16];
 	MixerObject MixerChan;
+	~PAS() {
+		PIC_RemoveEvents(PAS_PumpTick);
+		pas.pumpOn = false;
+		if (pas.dmachan != NULL) {
+			pas.dmachan->Register_Callback(NULL);
+			pas.dmachan = NULL;
+		}
+		if (pas.chan != NULL)
+			pas.chan->Enable(false);
+	}
 	PAS(Section* configuration):Module_base(configuration) {
 		Section_prop * section=static_cast<Section_prop *>(configuration);
 		if(!section->Get_bool("pas")||control->opt_silent) return;
 		pas.enabled = true;
 		pas.basePort = (unsigned int)section->Get_hex("pasbase");
-		pas.irq = (unsigned int)section->Get_int("pasirq");
+		pas.irq = section->Get_int("pasirq");
 		pas.dma = (unsigned int)section->Get_int("pasdma");
 		pas.rate = (unsigned int)section->Get_int("pasrate");
 
@@ -525,6 +928,27 @@ public:
 		pas.chan = NULL;
 		pas.midiR = 0;
 		pas.midiW = 0;
+		pas.dmachan = NULL;
+		pas.dmaMasked = true;
+		pas.dmaTC = false;
+		pas.dmaHold = 0;
+		pas.sampDry = false;
+		pas.pcmL = 0;
+		pas.pcmR = 0;
+		pas.pitCount[0] = pas.pitCount[1] = 0;
+		pas.pitMode[0] = pas.pitMode[1] = 3;
+		pas.pitAccess[0] = pas.pitAccess[1] = 3;
+		pas.pitNeed[0] = pas.pitNeed[1] = 0;
+		pas.pitSet[0] = pas.pitSet[1] = false;
+		pas.pitGate[0] = pas.pitGate[1] = false;
+		pas.pitReadHi[0] = pas.pitReadHi[1] = false;
+		pas.ctr1pos = 65536;
+		pas.pitClock = PAS_PIT_CLOCK;
+		pas.pumpOn = false;
+		pas.sbBase = 0;
+		pas.mpuBase = 0;
+		pas.sbOn = false;
+		pas.mpuOn = false;
 		PAS_ResetRegs();
 		pas.mixerCtrl = 0x00;
 		pas.midiCtrl = 0x00;
@@ -569,14 +993,22 @@ public:
 		WriteHandler[13].Install(pas.basePort + 0xfc00, pas_write, IO_MB);
 		ReadHandler[h].Install(pas.basePort + 0xfc03, pas_read, IO_MB); h++;
 		WriteHandler[14].Install(pas.basePort + 0xfc03, pas_write, IO_MB);
-		/* NOTE: base+0x1000 (1388-138B PIT rate/count) is deliberately
-		 * not installed here; the oracle delegates that window to its
-		 * PIT device and stage 3 attaches this fork's PIT there.
-		 * OPL aliases (base+0x0000) stay with the fork's live OPL
-		 * until the stage 3 OPL routing lands. */
+		ReadHandler[h].Install(pas.basePort + 0x1000, pas_pit_read, IO_MB, 4); h++;
+		WriteHandler[15].Install(pas.basePort + 0x1000, pas_pit_write, IO_MB, 4);
+		/* NOTE: OPL aliases (base+0x0000) are NOT installed here, by
+		 * decision. The card carries an OPL3, but this fork already
+		 * serves 0x388-0x38B from its shared OPL emulation, and the
+		 * default PAS base is 0x388, so the alias window coincides
+		 * with it (SB-style: the card owns no FM, the shared
+		 * emulation does). A non-default base would need forwarder
+		 * hooks into the OPL module, which has none to offer today
+		 * (STAGE4, owned by that module). Likewise the MV508 FM
+		 * voice gains computed above scale the PCM path only; mixing
+		 * the shared OPL output through them is the same STAGE4. */
 
 		pas.chan = MixerChan.Install(&PAS_Callback, pas.rate, "PAS");
 		pas.chan->Enable(false);
+		PAS_AttachDMA();
 
 		LOG_MSG("PAS:... finished.");
 	}
