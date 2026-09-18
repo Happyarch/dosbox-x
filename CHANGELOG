@@ -1,5 +1,10 @@
 Next version:
-  - 
+  - Added Pro Audio Spectrum 16 emulation (new [pas] section: pas=false,
+    pasbase=388h, pasirq=7, pasdma=3, pasrate=44100). Covers the MV508
+    mixer, DMA/IRQ/PIT-rate PCM engine, OPL wiring and MPU routing; FIR
+    coefficients, PIO samples, non-default-base OPL forwarding, the SB-DSP
+    and SCSI sides, and Plus/16D variants are deferred. Behavior
+    cross-checked against 86Box snd_pas16.c and the kernel OSS PAS16 docs.
 
 2026.08.31:
   - Added support for mounting TeleDisk (.td0) floppy image files. (cimarronm)
