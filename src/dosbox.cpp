@@ -364,6 +364,7 @@ void                TANDYSOUND_Init(Section*);
 void                DISNEY_Init(Section*);
 void                PS1SOUND_Init(Section*);
 void                INNOVA_Init(Section*);
+void                PAS_Init(Section*);
 void                IMFC_Init(Section*);
 void                SERIAL_Init(Section*);
 void                DONGLE_Init(Section*);
@@ -4215,6 +4216,24 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("quality",Property::Changeable::WhenIdle,0);
     Pint->Set_values(qualityno);
     Pint->Set_help("Set SID emulation quality level (0 to 3).");
+    Pint->SetBasic(true);
+
+    secprop = control->AddSection_prop("pas",&Null_Init,true);//done
+    Pbool = secprop->Add_bool("pas",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("Enable the Pro Audio Spectrum 16 emulation.");
+    Pbool->SetBasic(true);
+    Phex = secprop->Add_hex("pasbase",Property::Changeable::WhenIdle,0x388);
+    Phex->Set_help("PAS16 base port (typically 388h).");
+    Phex->SetBasic(true);
+    Pint = secprop->Add_int("pasirq",Property::Changeable::WhenIdle,7);
+    Pint->Set_help("IRQ number of the Pro Audio Spectrum 16 emulation.");
+    Pint->SetBasic(true);
+    Pint = secprop->Add_int("pasdma",Property::Changeable::WhenIdle,3);
+    Pint->Set_help("DMA channel of the Pro Audio Spectrum 16 emulation.");
+    Pint->SetBasic(true);
+    Pint = secprop->Add_int("pasrate",Property::Changeable::WhenIdle,44100);
+    Pint->Set_values(rates);
+    Pint->Set_help("Sample rate of the Pro Audio Spectrum 16 emulation.");
     Pint->SetBasic(true);
 
     secprop = control->AddSection_prop("imfc", &Null_Init, Property::Changeable::WhenIdle);
