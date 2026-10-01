@@ -432,14 +432,22 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
-/* MCP: soft-break flag set by socket thread; checked between CPU cycles */
+/* MCP: soft-break flag set by socket thread; checked between CPU cycles.
+ * Both symbols are provided by debug.cpp, whose ENTIRE body is inside
+ * `#if C_DEBUG` and therefore compiles to nothing when the internal debugger
+ * is disabled (e.g. the HX-DOS CI build).  Gate the hook on the same condition
+ * so a non-debug build emits no reference to them at all; otherwise the link
+ * fails with undefined references to mcp_break_pending/DEBUG_EnableDebugger. */
+#if C_DEBUG
 extern volatile bool mcp_break_pending;
 extern Bitu DEBUG_EnableDebugger(void);
+#endif
 
 static Bitu Normal_Loop(void) {
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
 
+#if C_DEBUG
     /* MCP: if socket client requested a break, drop into the headless debugger.
      * Return 0 so DOSBOX_RunMachine continues looping with the new loop handler
      * (mcp_headless_loop) that DEBUG_Enable_Handler installs. */
@@ -448,6 +456,7 @@ static Bitu Normal_Loop(void) {
         DEBUG_EnableDebugger();
         return 0;
     }
+#endif
 
     if (!menu.hidecycles || menu.showrt) { /* sdlmain.cpp/render.cpp doesn't even maintain the frames count when hiding cycles! */
         uint32_t ticksNew = GetTicks();
