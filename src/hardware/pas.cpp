@@ -35,8 +35,12 @@
 
 #include <string.h>
 #include "dosbox.h"
-#include "dma.h"
+/* inout.h must precede dma.h: dma.h's DMAChannel declares
+ * IO_ReadHandleObject/IO_WriteHandleObject (defined in inout.h) and dma.h does
+ * not include inout.h itself. Every other dma.h user already includes inout.h
+ * first; pas.cpp (PAS16 stage 4) did not, which broke the build. */
 #include "inout.h"
+#include "dma.h"
 #include "logging.h"
 #include "mixer.h"
 #include "pic.h"
