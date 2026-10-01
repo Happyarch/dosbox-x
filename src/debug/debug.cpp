@@ -52,6 +52,10 @@ using namespace std;
 #include "debug_inc.h"
 #include "../cpu/lazyflags.h"
 #include "control.h"
+#include "render.h"     /* SCREENSHOT: RENDER_CaptureImageNow */
+#include "hardware.h"   /* SCREENSHOT: CaptureState / CAPTURE_IMAGE */
+#include <limits.h>
+#include <stdlib.h>     /* realpath */
 
 #include "debug_mcp.h"
 
@@ -4605,6 +4609,10 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("Home/End                  - Move to begin/end of the current window.\n");
 		DEBUG_ShowMsg("TAB/Shift+TAB             - Select next/prev window\n");
 		DEBUG_ShowMsg("REGJSON                   - Emit all x86 registers as one JSON object (machine-readable).\n");
+		DEBUG_ShowMsg("SCREENSHOT                - Capture the video output to a PNG now, print its path.\n");
+		DEBUG_ShowMsg("                            This is the 'Save screenshot' kind (render source), taken\n");
+		DEBUG_ShowMsg("                            synchronously. 'Save raw screenshot' is multi-frame and is\n");
+		DEBUG_ShowMsg("                            not available from the debugger; SCREENSHOT RAW says so.\n");
 		DEBUG_EndPagedContent();
 
 		return true;
@@ -4626,6 +4634,120 @@ bool ParseCommand(char* str) {
 			(unsigned)SegValue(cs), (unsigned)SegValue(ds),
 			(unsigned)SegValue(es), (unsigned)SegValue(ss));
 		DEBUG_ShowMsg("%s", json);
+		return true;
+	}
+
+	/* Capture the video output to a PNG and print its absolute path.
+	 *
+	 * This is a screenshot of whatever the emulated display is showing —
+	 * DOS console text, a DPMI page-fault register dump, the BIOS screen,
+	 * a crashed guest — none of which any guest-memory dump can reach.
+	 * It deliberately depends on nothing about the guest program: no
+	 * selectors, no symbols, no live process.
+	 *
+	 * WHICH OF DOSBOX-X'S TWO CAPTURES THIS IS.  They are different things:
+	 *   - "Save screenshot" (CAPTURE_IMAGE) captures the RENDER SOURCE — the
+	 *     scaler's source cache plus the render palette.  That is this
+	 *     command, and it is the one that can be produced synchronously,
+	 *     because the cache holds the complete last frame at all times.
+	 *   - "Save raw screenshot" (CAPTURE_RAWIMAGE) captures at native VGA
+	 *     geometry straight off the scanline draw handlers, with the true DAC
+	 *     palette and an rPAL chunk of raw 6-bit DAC values.  It is
+	 *     inherently MULTI-FRAME: VGA_VerticalTimer arms it on one vertical
+	 *     retrace, the per-scanline handlers fill it during the frame, and a
+	 *     later retrace writes the file.  The debugger only executes
+	 *     commands while the emulation thread is stopped in the debugger loop
+	 *     — where no retrace and no scanline ever happens — so a raw capture
+	 *     requested from here could only ever hang or report a file that does
+	 *     not exist.  SCREENSHOT RAW therefore refuses, explicitly, rather
+	 *     than silently substituting the other kind.
+	 *
+	 * Synchronous by construction.  The mapper's "Save screenshot" action
+	 * only ARMS CaptureState and lets the next rendered frame do the work;
+	 * here in the debugger loop no further frame is rendered, so an armed
+	 * capture would never fire.  RENDER_CaptureImageNow() instead writes the
+	 * last rendered source frame out immediately, so the file exists before
+	 * this command replies.  Reply lines:
+	 *     SCREENSHOT <absolute path>       - written, and it is on disk
+	 *     SCREENSHOT ERROR <reason>        - nothing was written
+	 * Never print a path we have not stat()ed.
+	 *
+	 * Sub-commands:
+	 *     SCREENSHOT        synchronous capture (above)
+	 *     SCREENSHOT ARM    arm the STANDARD frame-driven capture and return
+	 *                       immediately; it fires on the next rendered frame,
+	 *                       i.e. only after the emulator resumes.  Replies
+	 *                       ARMED, never a path - there is no file yet.
+	 *     SCREENSHOT PATH   report the file the last ARMed capture wrote, once
+	 *                       it has fired.  This is the A/B partner of the
+	 *                       synchronous path: same frame, DOSBox-X's own
+	 *                       untouched CAPTURE_IMAGE plumbing.
+	 *     SCREENSHOT RAW    refused, with the reason (see above). */
+	if (command == "SCREENSHOT") {
+#if (C_SSHOT)
+		extern bool        debug_screenshot_request;
+		extern std::string debug_screenshot_path;
+
+		if (strcmp(found, "RAW") == 0) {
+			DEBUG_ShowMsg("SCREENSHOT ERROR raw capture (CAPTURE_RAWIMAGE) is multi-frame and "
+				"cannot complete while emulation is stopped in the debugger. "
+				"Use the mapper hotkey with the emulator running, or plain SCREENSHOT here.");
+			return true;
+		}
+		if (strcmp(found, "ARM") == 0) {
+			/* Sticky request flag: the capture happens later, on the emulation
+			 * thread, and must still land its path here and not in a modal box. */
+			debug_screenshot_path.clear();
+			debug_screenshot_request = true;
+			CaptureState |= CAPTURE_IMAGE;
+			DEBUG_ShowMsg("SCREENSHOT ARMED standard capture fires on the next rendered frame - resume, then SCREENSHOT PATH");
+			return true;
+		}
+		if (strcmp(found, "PATH") == 0) {
+			if (debug_screenshot_path.empty())
+				DEBUG_ShowMsg("SCREENSHOT ERROR no armed capture has fired yet");
+			else
+				DEBUG_ShowMsg("SCREENSHOT %s", debug_screenshot_path.c_str());
+			return true;
+		}
+
+		debug_screenshot_path.clear();
+		debug_screenshot_request = true;
+		CaptureState |= CAPTURE_IMAGE;
+		unsigned int sw=0, sh=0, sbpp=0;
+		bool rendered = RENDER_CaptureImageNow(&sw,&sh,&sbpp);
+		CaptureState &= ~((unsigned int)CAPTURE_IMAGE);  /* no armed leftover */
+
+		/* Self-describing: the render SOURCE geometry, before the capture's
+		 * own DBLW/DBLH doubling, so the caller can tell a mode-13h frame from
+		 * an 80x25 text screen without guessing from the PNG. */
+		DEBUG_ShowMsg("SCREENSHOT SRC %ux%u bpp=%u", sw, sh, sbpp);
+		if (!rendered) {
+			DEBUG_ShowMsg("SCREENSHOT ERROR no rendered frame available (renderer not started yet?)");
+			return true;
+		}
+		if (debug_screenshot_path.empty()) {
+			DEBUG_ShowMsg("SCREENSHOT ERROR capture file could not be opened (check the capture directory)");
+			return true;
+		}
+
+		/* Prove the file exists, and report it absolute — the caller is
+		 * another process that does not share our working directory. */
+		FILE *chk = fopen(debug_screenshot_path.c_str(), "rb");
+		if (!chk) {
+			DEBUG_ShowMsg("SCREENSHOT ERROR %s was not written", debug_screenshot_path.c_str());
+			return true;
+		}
+		fclose(chk);
+
+		char fullpath[PATH_MAX];
+		if (realpath(debug_screenshot_path.c_str(), fullpath) != NULL)
+			DEBUG_ShowMsg("SCREENSHOT %s", fullpath);
+		else
+			DEBUG_ShowMsg("SCREENSHOT %s", debug_screenshot_path.c_str());
+#else
+		DEBUG_ShowMsg("SCREENSHOT ERROR this build has no screenshot support (C_SSHOT off)");
+#endif
 		return true;
 	}
 
