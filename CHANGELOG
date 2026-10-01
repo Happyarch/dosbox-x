@@ -81,6 +81,8 @@ Next version:
     handling by dynamic core for DOS games that do not multitask. (joncampbell123)
   - Fixed items in Configuration Tools window were cropped (maron2000)
   - Added configuration and switch for composite mode (gschmidl)
+  - Debugger: Added an out-of-band MCP socket bridge with break-pending hooks
+    to signal the running emulator. (fork)
 
 2026.08.31:
   - Added support for mounting TeleDisk (.td0) floppy image files. (cimarronm)
