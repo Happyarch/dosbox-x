@@ -81,6 +81,8 @@ Next version:
     handling by dynamic core for DOS games that do not multitask. (joncampbell123)
   - Fixed items in Configuration Tools window were cropped (maron2000)
   - Added configuration and switch for composite mode (gschmidl)
+  - IMFC: accept SysEx sub-address 0x00 (real-hardware individual parameter
+    writes) and route it to the FB-01 engine like the Event List. (Happyarch)
 
 2026.08.31:
   - Added support for mounting TeleDisk (.td0) floppy image files. (cimarronm)

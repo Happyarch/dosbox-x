@@ -6339,7 +6339,10 @@ private:
 	static uint8_t processMidiState_17(MidiDataPacket* packet, uint8_t midiData)
 	{
 		packet->data[3] = midiData;
-		return midiData == 0x70 ? 0x18 : midiData == 0x71 ? 0x39 : 0x38;
+		// 0x70 = Event List (bulk), 0x71 = Parameter List — both pass to the FB-01 engine.
+		// 0x00 = real IMFC hardware sub-address for individual parameter writes (same
+		// wire format as Event List); route to 0x18 so real-format SysEx is accepted.
+		return midiData == 0x70 || midiData == 0x00 ? 0x18 : midiData == 0x71 ? 0x39 : 0x38;
 	}
 
 	// ROM Address: 0x0768
