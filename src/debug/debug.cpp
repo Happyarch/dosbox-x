@@ -32,7 +32,11 @@
 using namespace std;
 
 #include "../../tests/tests.h"
-/* MCP debug socket */
+/* MCP debug socket — the AF_UNIX bridge is Linux-only.  These POSIX headers
+ * exist solely to build it; on other platforms they would be a hard failure
+ * (MSVC has no <sys/socket.h>, HX-DOS has no <pthread.h>) and the bridge is
+ * not compiled there anyway.  See the guard on the bridge state below. */
+#if defined(__linux__)
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/un.h>
@@ -40,6 +44,7 @@ using namespace std;
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#endif
 
 #include "debug.h"
 #if defined(C_DOSBOX_AGENT)
@@ -363,7 +368,11 @@ static bool check_rescroll = false;
 static std::atomic<uint64_t> agent_entry_breakpoint_sequence(0);
 #endif
 
-/* MCP socket state */
+/* MCP socket state — Linux-only AF_UNIX bridge.
+ * On every other platform these objects/functions are not compiled.  The
+ * externs in debug_gui.cpp carry the SAME guard condition, or the link breaks
+ * exactly as it did on HX-DOS (undefined mcp_capture_buf). */
+#if defined(__linux__)
 static pthread_mutex_t mcp_mutex      = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  mcp_resp_cv    = PTHREAD_COND_INITIALIZER;
 static char            mcp_pending_cmd[256]; /* MAXCMDLEN=254, defined below */
@@ -371,14 +380,20 @@ static bool            mcp_cmd_ready      = false;
 static bool            mcp_awaiting_break = false;
 static std::string     mcp_response_buf;
 static bool            mcp_response_ready = false;
-bool               mcp_capture_active = false;  /* extern in debug_gui.cpp */
-std::string        mcp_capture_buf;              /* extern in debug_gui.cpp */
+bool               mcp_capture_active = false;  /* extern in debug_gui.cpp (Linux-only) */
+std::string        mcp_capture_buf;              /* extern in debug_gui.cpp (Linux-only) */
 static int         mcp_client_fd = -1;
 volatile bool      mcp_break_pending = false;   /* set from socket thread, checked in Normal_Loop */
 static bool        mcp_headless = false;        /* true when running without ncurses (no TTY) */
 static Bitu        mcp_headless_loop(void);     /* forward decl — defined near mcp_start_server */
 static void            mcp_start_server(const char* path);
 static bool        mcp_socket_started = false;  /* guard: start once from DEBUG_Init */
+#else
+/* Normal_Loop (dosbox.cpp) polls mcp_break_pending on every CPU slice on EVERY
+ * platform, so it must exist here as an always-false flag even though the
+ * socket thread that would set it is not built off Linux. */
+volatile bool      mcp_break_pending = false;
+#endif
 
 static FPU oldfpu;
 static bool warn_dynamic = false;
@@ -4662,6 +4677,7 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+#if defined(__linux__)
 	/* MCP: the BREAK notification, produced on demand.
 	 *
 	 * The socket thread's BREAK request works by asking Normal_Loop to enter
@@ -4678,6 +4694,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("EBP=%08X", (unsigned)reg_ebp);
 		return true;
 	}
+#endif
 
 	/* MCP: capture the video output to a PNG and print its absolute path.
 	 *
@@ -5732,6 +5749,7 @@ Bitu DEBUG_Loop(void) {
         }
 
         /* MCP: process one queued socket command per loop iteration */
+#if defined(__linux__)
         {
             pthread_mutex_lock(&mcp_mutex);
             bool has_cmd = mcp_cmd_ready;
@@ -5769,6 +5787,7 @@ Bitu DEBUG_Loop(void) {
                 /* For RUN: response is sent from DEBUG_Enable_Handler when break hits */
             }
         }
+#endif
 
     	return DEBUG_CheckKeys();
     }
@@ -5845,6 +5864,7 @@ void DEBUG_Enable_Handler(bool pressed) {
 	    allow = false;
 
     if (!allow) {
+#if defined(__linux__)
         if (mcp_socket_started) {
             /* Headless MCP mode: no TTY, no ncurses, but socket is active.
              * Enter a minimal loop that processes MCP commands without ncurses. */
@@ -5877,6 +5897,7 @@ void DEBUG_Enable_Handler(bool pressed) {
             }
             return;
         }
+#endif
 # if defined(MACOSX)
 	    LOG_MSG("Debugger in Mac OS X is not available unless you start DOSBox-X from a terminal or from the Terminal application");
 # else
@@ -5918,6 +5939,7 @@ void DEBUG_Enable_Handler(bool pressed) {
     runnormal = false;
 
     /* MCP: if a RUN command is pending a break response, send it now */
+#if defined(__linux__)
     {
         pthread_mutex_lock(&mcp_mutex);
         bool notify = mcp_awaiting_break;
@@ -5936,6 +5958,7 @@ void DEBUG_Enable_Handler(bool pressed) {
             pthread_mutex_unlock(&mcp_mutex);
         }
     }
+#endif
 
 #if defined(C_DOSBOX_AGENT)
     dosbox_agent::AGENT_NotifyDebuggerStopped(SegValue(cs), reg_eip);
@@ -6708,6 +6731,7 @@ void DEBUG_ShutDown(Section * /*sec*/) {
 
 Bitu debugCallback;
 
+#if defined(__linux__)
 /* Design A ("force_break preemption"): blocking socket waits with a
  * parked-BREAK preemption poll (2026-09).
  *
@@ -6940,6 +6964,7 @@ static void mcp_start_server(const char* path) {
     else
         free(path_copy);
 }
+#endif /* __linux__ MCP AF_UNIX bridge */
 
 void DEBUG_ReinitCallback(void) {
     /* this is REQUIRED after loading a custom BIOS */
@@ -6967,6 +6992,7 @@ void DEBUG_Init() {
 	AddExitFunction(AddExitFunctionFuncPair(DEBUG_ShutDown));
 
     /* MCP: start socket server at init so it's ready before first debugger entry */
+#if defined(__linux__)
     if (!mcp_socket_started) {
         Section_prop* lsect = static_cast<Section_prop*>(control->GetSection("log"));
         if (lsect) {
@@ -6977,6 +7003,7 @@ void DEBUG_Init() {
             }
         }
     }
+#endif
 }
 
 // DEBUGGING VAR STUFF

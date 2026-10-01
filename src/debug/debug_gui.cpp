@@ -47,9 +47,13 @@ bool log_int21 = false;
 bool log_fileio = false;
 extern bool logging_con;
 
-/* MCP capture hook (defined in debug.cpp) */
+/* MCP capture hook (defined in debug.cpp's Linux-only AF_UNIX bridge).
+ * This guard must match debug.cpp's definition guard exactly, or the link
+ * fails with an undefined reference on non-Linux builds (HX-DOS CI). */
+#if defined(__linux__)
 extern bool        mcp_capture_active;
 extern std::string mcp_capture_buf;
+#endif
 
 static bool has_LOG_Init = false;
 static bool has_LOG_EarlyInit = false;
@@ -894,10 +898,12 @@ void DEBUG_ShowMsg(char const* format,...) {
     }
 #endif
 
+#if defined(__linux__)
     if (mcp_capture_active) {
         mcp_capture_buf += buf;
         mcp_capture_buf += '\n';
     }
+#endif
 
     in_debug_showmsg = false;
 }
