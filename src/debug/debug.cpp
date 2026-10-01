@@ -27,6 +27,8 @@
 #include <iomanip>
 #include <string>
 #include <sstream>
+#include <algorithm>
+#include <unordered_map>
 using namespace std;
 
 #include "../../tests/tests.h"
@@ -577,6 +579,154 @@ public:
 };
 
 std::vector<CDebugVar*> CDebugVar::varList;
+
+/* --------------------------------------------------------------------------
+ * Program symbol table (SYMF / SYMLIST / SYMNEAR / SYMCLEAR)
+ *
+ * Loads a text symbol file: one "<hex-offset> <kind> <name>" entry per line,
+ * kind being one of T/t/D/d/B/b as in nm(1); '#' starts a comment line.
+ * Offsets are SEGMENT OFFSETS inside the loaded program image (link VMAs),
+ * never physical/linear addresses: symbols are resolved lazily against a
+ * selector at each use, so they survive DPMI-host base changes and program
+ * reloads. With no explicit selector argument to SYMF, code symbols (T/t)
+ * resolve against the CURRENT CS and data symbols against the CURRENT DS at
+ * the moment of use.
+ *
+ * The expression parser (GetHexValue) consults this table for identifier
+ * tokens, so symbol names work anywhere an address expression does:
+ * BP CS:OverworldLoop, C CS:MySym, EV MySym+4, ... Precedence is
+ * register/flag -> symbol -> hex literal; digit-leading tokens are always
+ * hex (a symbol name cannot start with a digit), and double-quoting forces
+ * hex ("ADDBCD"), the same escape that already disambiguates flag-colliding
+ * values like "AF". Only names that collide with a register/flag/pseudo
+ * token stay unreachable by name; SYMF warns when it loads such names.
+ * -------------------------------------------------------------------------- */
+
+struct DebugSymbol {
+    std::string name;
+    uint32_t    ofs;
+    uint16_t    sel;    /* 0 = dynamic: SegValue(cs) for code, SegValue(ds) for data */
+    char        kind;   /* T/t/D/d/B/b */
+    bool IsCode(void) const { return kind=='T' || kind=='t'; }
+};
+
+static std::vector<DebugSymbol> dbgSyms;                      /* sorted by ofs */
+static std::unordered_map<std::string,size_t> dbgSymsByName;  /* UPPERCASED name -> index */
+
+static std::string DebugSymUpcase(const std::string& s) {
+    std::string r(s);
+    for (auto &c : r) c = (char)toupper((unsigned char)c);
+    return r;
+}
+
+void DEBUG_SymClear(void) {
+    dbgSyms.clear();
+    dbgSymsByName.clear();
+}
+
+uint16_t DEBUG_SymSelector(const DebugSymbol* s) {
+    if (s->sel) return s->sel;
+    return s->IsCode() ? SegValue(cs) : SegValue(ds);
+}
+
+const DebugSymbol* DEBUG_SymFindByName(const char* name) {
+    if (dbgSyms.empty()) return NULL;
+    auto it = dbgSymsByName.find(DebugSymUpcase(name));
+    if (it == dbgSymsByName.end()) return NULL;
+    return &dbgSyms[it->second];
+}
+
+/* nearest symbol at or below ofs (codeOnly keeps only T/t); delta out */
+const DebugSymbol* DEBUG_SymNearest(uint32_t ofs, bool codeOnly, uint32_t* delta) {
+    if (dbgSyms.empty()) return NULL;
+    size_t lo = 0, hi = dbgSyms.size();
+    while (lo < hi) {              /* first element with .ofs > ofs */
+        size_t mid = (lo + hi) / 2;
+        if (dbgSyms[mid].ofs <= ofs) lo = mid + 1;
+        else hi = mid;
+    }
+    while (lo > 0) {               /* walk down to satisfy the kind filter */
+        const DebugSymbol* s = &dbgSyms[lo-1];
+        if (!codeOnly || s->IsCode()) {
+            if (delta) *delta = ofs - s->ofs;
+            return s;
+        }
+        lo--;
+    }
+    return NULL;
+}
+
+/* names GetHexValue resolves before the symbol table -- symbols so named are
+ * unreachable by name in expressions (quote-as-hex does not help either) */
+static bool DebugSymIsReservedName(const std::string& upperName) {
+    static const char* const reserved[] = {
+        "EFLAGS","FLAGS","IOPL","CR0","CR2","CR3","CR4","SYSENTER",
+        "EAX","EBX","ECX","EDX","ESI","EDI","EBP","ESP","EIP",
+        "AX","BX","CX","DX","SI","DI","BP","SP","IP",
+        "AL","BL","CL","DL","AH","BH","CH","DH",
+        "CS","DS","ES","FS","GS","SS",
+        "AC","AF","CF","DF","ID","IF","NT","OF","PF","SF","TF","VM","ZF",
+        "DTASEG","DTAOFF","PSPSEG", NULL
+    };
+    for (size_t i = 0; reserved[i]; i++)
+        if (upperName == reserved[i]) return true;
+    return false;
+}
+
+/* returns number of symbols loaded, or -1 on open failure.
+ * shadowed (optional out): how many names collide with a register/flag/
+ * pseudo token and are therefore unreachable by name in expressions. */
+long DEBUG_SymLoadFile(const char* path, uint16_t forcedSel, unsigned long* shadowed) {
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    DEBUG_SymClear();
+    if (shadowed) *shadowed = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == 0 || *p == '\n' || *p == '\r' || *p == '#') continue;
+        char* end = NULL;
+        unsigned long ofs = strtoul(p, &end, 16);
+        if (end == p) continue;
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        char kind = *p;
+        if (kind == 0 || strchr("TtDdBb", kind) == NULL) continue;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        char* nend = p;
+        while (*nend && !isspace((unsigned char)*nend)) nend++;
+        if (nend == p) continue;
+        DebugSymbol s;
+        s.name.assign(p, (size_t)(nend - p));
+        s.ofs = (uint32_t)ofs;
+        s.sel = forcedSel;
+        s.kind = kind;
+        dbgSyms.push_back(s);
+    }
+    fclose(f);
+    std::sort(dbgSyms.begin(), dbgSyms.end(),
+              [](const DebugSymbol& a, const DebugSymbol& b){ return a.ofs < b.ofs; });
+    dbgSymsByName.clear();
+    dbgSymsByName.reserve(dbgSyms.size());
+    for (size_t i = 0; i < dbgSyms.size(); i++) {
+        const std::string key = DebugSymUpcase(dbgSyms[i].name);
+        dbgSymsByName.emplace(key, i);   /* first definition wins */
+        if (shadowed && DebugSymIsReservedName(key)) (*shadowed)++;
+    }
+    return (long)dbgSyms.size();
+}
+
+/* expression-parser hook: resolve an identifier token (any case) to its
+ * symbol offset. Pure-hex tokens never reach this (hex literals win). */
+static bool DEBUG_SymTokenValue(const std::string& token, uint32_t* val) {
+    if (dbgSyms.empty()) return false;
+    auto it = dbgSymsByName.find(DebugSymUpcase(token));
+    if (it == dbgSymsByName.end()) return false;
+    *val = dbgSyms[it->second].ofs;
+    return true;
+}
 
 static void AnnotateDirectBranch(char* line, const size_t line_size)
 {
@@ -1649,6 +1799,17 @@ static void DrawCode(void) {
 		char* res = empty_res;
         wattrset (dbg.win_code,0);
         if (showExtend) res = AnalyzeInstruction(dline, saveSel);
+        /* a row that begins a labeled routine/local shows its symbol name in
+           the analysis column (truncated to the column's 20 chars) */
+        {
+            uint32_t symdelta = 1;
+            const DebugSymbol* dsym = DEBUG_SymNearest(disEIP, true, &symdelta);
+            if (dsym && symdelta == 0) {
+                static char symres[21];
+                snprintf(symres, sizeof(symres), "%s", dsym->name.c_str());
+                res = symres;
+            }
+        }
 		// Spacepad it up to 28 characters
         if (no_bytes) dline[0] = 0;
 		size_t dline_len = strlen(dline);
@@ -1817,7 +1978,9 @@ uint32_t GetHexValue(char* const str, char* &hex,bool *parsed,int exprge)
         }
         else {
             start = hex;
-            while (isalpha(*hex) || isdigit(*hex) || *hex == '_') {
+            /* '.' admitted for program symbols with NASM-style local labels
+               (e.g. _AdvancePlayerSprite.scroll) -- see SYMF */
+            while (isalpha(*hex) || isdigit(*hex) || *hex == '_' || *hex == '.') {
                 if (!isxdigit(*hex)) hexnumber = false;
                 hex++;
             }
@@ -1888,6 +2051,16 @@ uint32_t GetHexValue(char* const str, char* &hex,bool *parsed,int exprge)
             else if (something == "DTAOFF") { regval = (!dos_kernel_disabled) ? (dos.dta() & 0xFFFFu) : 0; }
             else if (something == "PSPSEG") { regval = (!dos_kernel_disabled) ?  dos.psp()            : 0; }
             else if (CDebugVar* variable = CDebugVar::FindVar(something)) { regval = variable->GetAdr(); }
+            /* Program symbols (SYMF) resolve BEFORE the hex-literal fallback,
+               so names made only of hex digits (AddBCD) work like any other
+               name. This cannot break machine-generated hex (disassembly
+               operands, "0001F2A0"): those start with a digit, and a symbol
+               name never can — digit-leading tokens skip the lookup. To force
+               a hex literal that collides with a symbol name, quote it
+               ("ADDBCD"), the same escape that already forces hex for
+               flag-colliding values like "AF". */
+            else if (!isdigit((unsigned char)something[0]) &&
+                      DEBUG_SymTokenValue(something,&regval)) { /* symbol -> segment offset */ }
             else if (hexnumber) { regval = (uint32_t)strtoul(something.c_str(),NULL,16/*hexadecimal*/); }
             else { if (parsed) *parsed = 0; return 0; }
         }
@@ -2176,6 +2349,10 @@ bool ParseCommand(char* str) {
 	stream >> command;
 	string::size_type next = s_found.find_first_not_of(' ',command.size());
 	if(next == string::npos) next = command.size();
+	/* where the first argument starts in the ORIGINAL string: commands with
+	   case-sensitive arguments (e.g. SYMF's file path -- the working copy is
+	   uppercased above) recover them from str at this offset */
+	const size_t argOffsetInStr = (size_t)(found - &copy_str[0]) + next;
 	(s_found.erase)(0,next);
 	found = const_cast<char*>(s_found.c_str());
 
@@ -2580,6 +2757,106 @@ bool ParseCommand(char* str) {
 		name[12] = 0;
 		if(!name[0]) return false;
 		DEBUG_ShowMsg("DEBUG: Variable list load (%s) : %s.\n",name,(CDebugVar::LoadVars(name)?"ok":"failure"));
+		return true;
+	}
+
+	if (command == "SYMF") { // load program symbol file: SYMF <file> [selector]
+		/* the file path is case-sensitive: recover it from the original,
+		   un-uppercased input string. A double-quoted path may contain
+		   spaces ("/path/with spaces/pkmn.sym"). */
+		const char* argraw = str + argOffsetInStr;
+		while (*argraw == ' ' || *argraw == '\t') argraw++;
+		char fname[256];
+		size_t fi = 0;
+		const char* argend; /* first char after the path token in str */
+		if (*argraw == '"') {
+			const char* p = argraw + 1;
+			while (*p && *p != '"' && fi < sizeof(fname)-1) fname[fi++] = *p++;
+			if (*p == '"') p++;
+			argend = p;
+		} else {
+			const char* p = argraw;
+			while (*p && !isspace((unsigned char)*p) && fi < sizeof(fname)-1) fname[fi++] = *p++;
+			argend = p;
+		}
+		fname[fi] = 0;
+		if (!fname[0]) {
+			DEBUG_ShowMsg("DEBUG: usage: SYMF <file> [selector]\n");
+			return false;
+		}
+		/* optional selector: parse the remainder past the (possibly quoted)
+		   path. 'found' cannot be used -- its uppercased copy of a quoted path
+		   tokenizes differently -- so re-anchor into the uppercased copy at
+		   the same offset so GetHexValue sees its usual uppercased input. */
+		uint16_t sel = 0;
+		{
+			char* p = &copy_str[0] + (size_t)(argend - str);
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p) sel = (uint16_t)GetHexValue(p,p);
+		}
+		unsigned long shadowed = 0;
+		long count = DEBUG_SymLoadFile(fname, sel, &shadowed);
+		if (count < 0) {
+			DEBUG_ShowMsg("DEBUG: SYMF: cannot open %s\n", fname);
+			return false;
+		}
+		DEBUG_ShowMsg("DEBUG: SYMF: loaded %ld symbols from %s%s\n",
+		              count, fname, sel ? " (forced selector)" : " (dynamic CS/DS)");
+		if (shadowed)
+			DEBUG_ShowMsg("DEBUG: SYMF: %lu names collide with register/flag tokens and are unreachable by name\n",
+			              shadowed);
+		return true;
+	}
+
+	if (command == "SYMCLEAR") { // drop the program symbol table
+		DEBUG_SymClear();
+		DEBUG_ShowMsg("DEBUG: symbol table cleared.\n");
+		return true;
+	}
+
+	if (command == "SYMLIST") { // list symbols matching a substring
+		std::string pat(found ? found : "");
+		/* strip trailing whitespace from the pattern */
+		while (!pat.empty() && isspace((unsigned char)pat.back())) pat.pop_back();
+		const unsigned int cap = 50;
+		unsigned int shown = 0, matched = 0;
+		for (const auto &s : dbgSyms) {
+			if (!pat.empty() && DebugSymUpcase(s.name).find(pat) == std::string::npos) continue;
+			matched++;
+			if (shown < cap) {
+				DEBUG_ShowMsg("%08X %c %s\n", s.ofs, s.kind, s.name.c_str());
+				shown++;
+			}
+		}
+		if (matched > shown)
+			DEBUG_ShowMsg("DEBUG: SYMLIST: %u of %u matches shown; narrow the pattern\n", shown, matched);
+		else
+			DEBUG_ShowMsg("DEBUG: SYMLIST: %u match(es) of %u symbols\n", matched, (unsigned int)dbgSyms.size());
+		return true;
+	}
+
+	if (command == "SYMNEAR") { // nearest symbol at or below an offset
+		bool parsed = false;
+		uint32_t ofs = GetHexValue(found,found,&parsed);
+		if (!parsed) {
+			DEBUG_ShowMsg("DEBUG: usage: SYMNEAR <offset-expr> (e.g. SYMNEAR EIP)\n");
+			return false;
+		}
+		uint32_t dc = 0, da = 0;
+		const DebugSymbol* code = DEBUG_SymNearest(ofs, true,  &dc);
+		const DebugSymbol* any  = DEBUG_SymNearest(ofs, false, &da);
+		if (!any) {
+			DEBUG_ShowMsg("DEBUG: SYMNEAR: no symbols loaded at or below %08X (use SYMF)\n", ofs);
+			return true;
+		}
+		if (code) {
+			if (dc) DEBUG_ShowMsg("DEBUG: %08X = %s+%X (code)\n", ofs, code->name.c_str(), dc);
+			else    DEBUG_ShowMsg("DEBUG: %08X = %s (code)\n", ofs, code->name.c_str());
+		}
+		if (any != code) {
+			if (da) DEBUG_ShowMsg("DEBUG: %08X = %s+%X (%c)\n", ofs, any->name.c_str(), da, any->kind);
+			else    DEBUG_ShowMsg("DEBUG: %08X = %s (%c)\n", ofs, any->name.c_str(), any->kind);
+		}
 		return true;
 	}
 
@@ -4275,6 +4552,11 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("IV [seg]:[off] [name]     - Create var name for memory address.\n");
 		DEBUG_ShowMsg("SV [filename]             - Save var list in file.\n");
 		DEBUG_ShowMsg("LV [filename]             - Load var list from file.\n");
+		DEBUG_ShowMsg("SYMF [file] [selector]    - Load program symbol file (\"<hexofs> <T|t|D|d|B|b> <name>\" lines).\n");
+		DEBUG_ShowMsg("                            Names then work in expressions: BP CS:MySym, EV MySym+4.\n");
+		DEBUG_ShowMsg("SYMLIST [pattern]         - List loaded symbols matching substring.\n");
+		DEBUG_ShowMsg("SYMNEAR [offset-expr]     - Nearest symbol at or below offset (e.g. SYMNEAR EIP).\n");
+		DEBUG_ShowMsg("SYMCLEAR                  - Drop the program symbol table.\n");
 
 		DEBUG_ShowMsg("VRD                       - Redraw video.\n");
 		DEBUG_ShowMsg("VGA cmd                   - VGA related debugging commands.\n");
@@ -4322,8 +4604,28 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("Page Up/Down              - Page up/down in the current window.\n");
 		DEBUG_ShowMsg("Home/End                  - Move to begin/end of the current window.\n");
 		DEBUG_ShowMsg("TAB/Shift+TAB             - Select next/prev window\n");
+		DEBUG_ShowMsg("REGJSON                   - Emit all x86 registers as one JSON object (machine-readable).\n");
 		DEBUG_EndPagedContent();
 
+		return true;
+	}
+
+	/* emit registers as JSON for machine-readable consumption */
+	if (command == "REGJSON") {
+		char json[512];
+		snprintf(json, sizeof(json),
+			"{\"EAX\":\"%08X\",\"EBX\":\"%08X\",\"ECX\":\"%08X\",\"EDX\":\"%08X\","
+			"\"ESI\":\"%08X\",\"EDI\":\"%08X\",\"EBP\":\"%08X\",\"ESP\":\"%08X\","
+			"\"EIP\":\"%08X\",\"EFLAGS\":\"%08X\","
+			"\"CS\":\"%04X\",\"DS\":\"%04X\",\"ES\":\"%04X\",\"SS\":\"%04X\"}",
+			(unsigned)reg_eax, (unsigned)reg_ebx,
+			(unsigned)reg_ecx, (unsigned)reg_edx,
+			(unsigned)reg_esi, (unsigned)reg_edi,
+			(unsigned)reg_ebp, (unsigned)reg_esp,
+			(unsigned)reg_eip, (unsigned)reg_flags,
+			(unsigned)SegValue(cs), (unsigned)SegValue(ds),
+			(unsigned)SegValue(es), (unsigned)SegValue(ss));
+		DEBUG_ShowMsg("%s", json);
 		return true;
 	}
 
@@ -4461,6 +4763,30 @@ char* AnalyzeInstruction(char* inst, bool saveSelector) {
 		const char* descr = CALLBACK_GetDescription(nr);
 		if (descr) {
 			strcat(inst,"  ("); strcat(inst,descr); strcat(inst,")");
+		}
+	}
+	// Symbolic target annotation for near call/jmp/jcc/loop with an absolute
+	// 8-hex-digit target (the disassembler's %J format): append "; name[+ofs]"
+	if (instu[0] == 'J' || !strncmp(instu,"CALL",4) || !strncmp(instu,"LOOP",4)) {
+		char* t = instu;
+		while (*t && *t != ' ') t++;
+		while (*t == ' ') t++;
+		int n = 0;
+		while (isxdigit((unsigned char)t[n])) n++;
+		if (n == 8 && (t[n] == 0 || t[n] == ' ')) {
+			uint32_t target = (uint32_t)strtoul(t,NULL,16);
+			uint32_t delta = 0;
+			const DebugSymbol* sym = DEBUG_SymNearest(target, true, &delta);
+			/* a huge delta means the target is past the last known label --
+			   not meaningfully "inside" that symbol; stay quiet then */
+			if (sym && delta < 0x2000) {
+				const size_t len = strlen(inst);
+				const size_t cap = 200; /* callers pass dline[200] */
+				if (len + 4 < cap) {
+					if (delta) snprintf(inst+len, cap-len, " ; %s+%X", sym->name.c_str(), delta);
+					else       snprintf(inst+len, cap-len, " ; %s",   sym->name.c_str());
+				}
+			}
 		}
 	}
 	// Must be a jump
@@ -5355,6 +5681,7 @@ void DEBUG_Enable_Handler(bool pressed) {
 	//KEYBOARD_ClrBuffer();
     GFX_SetTitle(-1,-1,-1,false);
     runnormal = false;
+
 #if defined(C_DOSBOX_AGENT)
     dosbox_agent::AGENT_NotifyDebuggerStopped(SegValue(cs), reg_eip);
 #endif
