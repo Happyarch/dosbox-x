@@ -4740,11 +4740,19 @@ bool ParseCommand(char* str) {
 		}
 		fclose(chk);
 
+		/* realpath() is POSIX.  HAVE_REALPATH is probed by autotools and is
+		 * absent from the MSVC build (vs/config.h), which has no realpath at
+		 * all; there, report the path exactly as given rather than failing to
+		 * compile. */
+#if defined(HAVE_REALPATH)
 		char fullpath[PATH_MAX];
 		if (realpath(debug_screenshot_path.c_str(), fullpath) != NULL)
 			DEBUG_ShowMsg("SCREENSHOT %s", fullpath);
 		else
 			DEBUG_ShowMsg("SCREENSHOT %s", debug_screenshot_path.c_str());
+#else
+		DEBUG_ShowMsg("SCREENSHOT %s", debug_screenshot_path.c_str());
+#endif
 #else
 		DEBUG_ShowMsg("SCREENSHOT ERROR this build has no screenshot support (C_SSHOT off)");
 #endif
